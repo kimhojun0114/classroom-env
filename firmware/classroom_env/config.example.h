@@ -10,7 +10,7 @@
 // ── Firebase Realtime Database ───────────
 // 예: "https://classroom-env-default-rtdb.asia-southeast1.firebasedatabase.app"
 // (끝에 / 붙이지 않기)
-#define FIREBASE_URL    "https://YOUR-PROJECT-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_URL    "https://classroom-env-default-rtdb.asia-southeast1.firebasedatabase.app"
 // 프로젝트 설정 > 서비스 계정 > 데이터베이스 비밀번호(Database secrets)
 #define FIREBASE_SECRET "YOUR_DATABASE_SECRET"
 
