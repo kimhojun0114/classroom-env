@@ -1,0 +1,5 @@
+# 비밀번호가 들어 있는 설정 파일은 올리지 않음
+firmware/classroom_env/config.h
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
