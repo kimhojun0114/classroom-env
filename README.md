@@ -40,7 +40,7 @@
 | BH1750 (조도) | 보드 **I2C 묶음 ②줄**에 바로 (ADDR은 비워 둠) |
 | I2C LCD | SDA → **D21 S**, SCL → **D22 S**, VCC → 빵판 **5V 줄**, GND → 빵판 GND 줄 |
 | MAX4466 (소리) | **D34**의 S(OUT)·V(VCC)·G(GND) |
-| MH-Z19C (CO₂) | Vin → 5V 줄, GND → GND 줄, Tx → **D16 S**, Rx → **D17 S** (HD·PWM·Vo 연결 금지) |
+| MH-Z19C (CO₂) | Vin → 5V 줄, GND → GND 줄, Tx → **D16 S**, Rx → **D17 S**, PWM → **D4 S** (HD·Vo 연결 금지) |
 | 서보모터 | 주황(신호) → **D23 S**, 빨강 → 5V 줄, 갈색 → GND 줄 |
 | 신호등 LED | D25/D26/D27 S → 저항 → LED 긴 다리, 짧은 다리 → GND 줄 |
 | 빵판 레일 | 보드 전원 묶음 **5V → + 줄**, **GND → − 줄** |
@@ -97,7 +97,8 @@
 |---|---|
 | `ts`, `time` | 측정 시각 (유닉스 시간, 한국 시간) |
 | `flag` | `warmup` = CO₂ 예열 중(분석에서 제외), `ok` |
-| `co2` | CO₂ ppm (10초 평균) |
+| `co2` | CO₂ ppm (UART, 10초 평균) — 판단에 사용 |
+| `co2_pwm` | 같은 센서의 PWM 출력으로 계산한 CO₂ — UART 값 검증용 |
 | `temp`, `hum`, `lux` | 온도 ℃, 습도 %, 조도 lx |
 | `snd_mean`, `snd_std`, `snd_max` | 50ms 진폭(ADC)의 평균·표준편차·최댓값 — 크기와 변동성 |
 | `snd_spikes` | 배경보다 2배 이상 튄 소리의 횟수 (말소리·충격음) |

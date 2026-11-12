@@ -3,7 +3,7 @@
  * 20713 김호준 · 인공지능 융합 프로젝트
  *
  * 하는 일
- *  1) 소리(MAX4466)는 50ms 창 단위로 계속 측정, CO2·온습도·조도는 1초마다 측정
+ *  1) 소리(MAX4466)는 50ms 창 단위로 계속 측정, CO2(UART·PWM 두 방식)·온습도·조도는 1초마다 측정
  *  2) 10초마다 평균을 내서 하나의 기록으로 만들고 Firebase 에 업로드
  *  3) 최근 10분 기록으로 특징 8개를 계산해 학습 상태(최적/졸림/산만)를 판단
  *     - USE_MLP 0 : 임시 규칙(데이터 수집 기간용)
@@ -52,6 +52,7 @@ const int SERVO_CLOSED = 0;   // 창문 닫힘 각도
 const int SERVO_OPEN   = 90;  // 창문 열림 각도 (모형에 맞게 조정)
 const int PIN_CO2_RX  = 16;   // ESP32 RX2 ← MH-Z19C TX
 const int PIN_CO2_TX  = 17;   // ESP32 TX2 → MH-Z19C RX
+const int PIN_CO2_PWM = 4;    // MH-Z19C PWM 출력 (UART 값 검증용)
 // I2C: SDA 21, SCL 22 (LCD, BH1750, SHT 공유)
 const int REED_PINS[8] = {13, 14, 18, 19, 32, 33, 4, 5};
 
@@ -87,7 +88,7 @@ struct Rec {
   time_t ts;
   float sndMean, sndStd, sndMax;
   int   sndSpikes;
-  float co2, temp, hum, lux;
+  float co2, co2pwm, temp, hum, lux;
 };
 Rec buf[BUF_N];
 int bufCount = 0, bufHead = 0;   // bufHead = 다음에 쓸 위치
@@ -153,6 +154,33 @@ int readCO2() {
   return r[2] * 256 + r[3];
 }
 
+// ───────── MH-Z19C PWM (인터럽트로 HIGH·LOW 길이 측정) ─────────
+// 주기 약 1004ms. CO2 = 범위 × (Th − 2ms) / (Th + Tl − 4ms)
+#ifndef CO2_PWM_RANGE
+#define CO2_PWM_RANGE 5000      // 센서 측정 범위(ppm). UART 값의 약 0.4배로 나오면 2000으로 바꾸기
+#endif
+volatile uint32_t pwmRise = 0, pwmFall = 0, pwmTh = 0, pwmTl = 0, pwmStamp = 0;
+void IRAM_ATTR co2PwmISR() {
+  uint32_t now = micros();
+  if (digitalRead(PIN_CO2_PWM)) {             // 올라가는 순간: 직전 LOW 길이 확정
+    if (pwmFall) pwmTl = now - pwmFall;
+    pwmRise = now;
+  } else if (pwmRise) {                        // 내려가는 순간: HIGH 길이 확정
+    pwmTh = now - pwmRise;
+    pwmFall = now;
+    pwmStamp = millis();
+  }
+}
+int readCO2pwm() {
+  noInterrupts();
+  uint32_t th = pwmTh, tl = pwmTl, st = pwmStamp;
+  interrupts();
+  if (!th || !tl || millis() - st > 3000) return -1;      // 3초 넘게 신호 없음
+  float thm = th / 1000.0f, tlm = tl / 1000.0f, period = thm + tlm;
+  if (period < 900 || period > 1100) return -1;           // 주기가 이상하면 버림
+  return (int)(CO2_PWM_RANGE * (thm - 2) / (period - 4));
+}
+
 void setCO2ABC(bool on) {
   uint8_t cmd[9] = {0xFF, 0x01, 0x79, (uint8_t)(on ? 0xA0 : 0x00), 0, 0, 0, 0, 0};
   cmd[8] = mhzChecksum(cmd);
@@ -160,12 +188,14 @@ void setCO2ABC(bool on) {
 }
 
 // ───────── 1초 측정 누적 ─────────
-float co2Acc = 0, tAcc = 0, hAcc = 0, luxAcc = 0;
-int   co2Cnt = 0, thCnt = 0, luxCnt = 0;
+float co2Acc = 0, co2pAcc = 0, tAcc = 0, hAcc = 0, luxAcc = 0;
+int   co2Cnt = 0, co2pCnt = 0, thCnt = 0, luxCnt = 0;
 
 void readEnvOnce() {
   int c = readCO2();
   if (c > 0 && c < 10000) { co2Acc += c; co2Cnt++; }
+  int cp = readCO2pwm();
+  if (cp > 0 && cp < 10000) { co2pAcc += cp; co2pCnt++; }
   if (shtOk) {
 #if SHT_MODEL == 40
     sensors_event_t hum, temp;
@@ -405,14 +435,15 @@ void makeRecord() {
   r.sndSpikes = spk;
 
   r.co2  = co2Cnt ? co2Acc / co2Cnt : NAN;
+  r.co2pwm = co2pCnt ? co2pAcc / co2pCnt : NAN;
   r.temp = thCnt ? tAcc / thCnt : NAN;
   r.hum  = thCnt ? hAcc / thCnt : NAN;
   r.lux  = luxCnt ? luxAcc / luxCnt : NAN;
-  co2Acc = tAcc = hAcc = luxAcc = 0; co2Cnt = thCnt = luxCnt = 0;
+  co2Acc = co2pAcc = tAcc = hAcc = luxAcc = 0; co2Cnt = co2pCnt = thCnt = luxCnt = 0;
 
   uint32_t up = millis() / 1000;
   bool warm = up < WARMUP_S;
-  if (warm) r.co2 = NAN;                 // 예열 중 CO2 는 판단에 쓰지 않음
+  if (warm) { r.co2 = NAN; r.co2pwm = NAN; }   // 예열 중 CO2 는 판단에 쓰지 않음
 
   buf[bufHead] = r;
   bufHead = (bufHead + 1) % BUF_N;
@@ -430,6 +461,7 @@ void makeRecord() {
     ",\"up\":" + String(up) +
     ",\"flag\":\"" + (warm ? "warmup" : "ok") + "\"" +
     ",\"co2\":" + jnum(r.co2, 0) +
+    ",\"co2_pwm\":" + jnum(r.co2pwm, 0) +
     ",\"temp\":" + jnum(r.temp, 2) +
     ",\"hum\":" + jnum(r.hum, 2) +
     ",\"lux\":" + jnum(r.lux, 1) +
@@ -500,6 +532,8 @@ void setup() {
 #if CO2_ABC_OFF
   delay(100); setCO2ABC(false);
 #endif
+  pinMode(PIN_CO2_PWM, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PIN_CO2_PWM), co2PwmISR, CHANGE);
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
