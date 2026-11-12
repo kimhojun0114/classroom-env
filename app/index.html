@@ -126,6 +126,7 @@ details summary{cursor:pointer;color:var(--sub);font-size:14px}
       <label>환기 해제 기준 (ppm)<input type="number" id="co2Clear" step="50"></label>
       <label>미리 알림 (분 전)<input type="number" id="etaMin" step="1"></label>
       <label>소음 기준 (30초 급증 횟수)<input type="number" id="noise30" step="1"></label>
+      <label>지속 소음 기준 (LCD S값)<input type="number" id="loudLvl" step="50"></label>
       <label>최소 조도 (lx)<input type="number" id="luxLow" step="10"></label>
       <label>최고 온도 (℃)<input type="number" id="tMax" step="0.5"></label>
     </div>
@@ -149,7 +150,7 @@ const store = {
   set(k,v){ try { localStorage.setItem(k,v); } catch(e){} }
 };
 let secret = store.get("fb_secret") || "";
-let control = { winMode:"auto", co2Drowsy:2000, co2Clear:1000, etaMin:10, noise30:6, luxLow:100, tMax:28 };
+let control = { winMode:"auto", co2Drowsy:2000, co2Clear:1000, etaMin:10, noise30:6, loudLvl:500, luxLow:100, tMax:28 };
 const label = { focus:null, drowsy:null, sleeping:0 };
 
 function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2200); }
@@ -253,7 +254,7 @@ function drawChart(){
 }
 
 // ── 원격 조절 ──
-const ctlFields=["co2Drowsy","co2Clear","etaMin","noise30","luxLow","tMax"];
+const ctlFields=["co2Drowsy","co2Clear","etaMin","noise30","loudLvl","luxLow","tMax"];
 function showControl(){
   ctlFields.forEach(k=>$("#"+k).value=control[k]);
   document.querySelectorAll("#fanSeg button").forEach(b=>b.classList.toggle("sel", b.dataset.v===control.winMode));

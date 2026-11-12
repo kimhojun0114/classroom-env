@@ -78,6 +78,7 @@ struct Control {
   float luxLow    = 100;    // 이보다 어두우면 '조명 부족' (학교보건법 300lx는 웹앱에서 조정)
   float tMin = 18, tMax = 28;   // 온도 기준(℃)
   float hMin = 30, hMax = 80;   // 습도 기준(%)
+  float loudLvl   = 500;    // 최근 5초 평균 소리 크기(진폭)가 이 이상이면 '계속 시끄러움' → 산만
   float noise30   = 6;      // 최근 30초 급증 횟수가 이 이상이면 '산만' (2회 이하로 줄면 해제)
   String winMode  = "auto"; // 창문(서보): auto / on(열기) / off(닫기)
 } ctl;
@@ -113,11 +114,16 @@ int   sndN = 0, sndSpikes = 0;
 const int SPK_RING = 32;
 uint32_t spikeT[SPK_RING] = {0};
 int spikeHead = 0;
+// 지속 소음 판정용: 1초 평균 진폭을 최근 10초치 보관
+const int SEC_RING = 10;
+float secLvl[SEC_RING] = {0};
+int secHead = 0, secFilled = 0;
 
 void soundTask(void*) {
   float baseline = -1;
   bool inSpike = false;
-  int  overRun = 0;
+  int  overRun = 0, heldRun = 0, secN = 0;
+  float secSum = 0;
   for (;;) {
     int mn = 4095, mx = 0;
     uint32_t t0 = millis();
@@ -132,6 +138,8 @@ void soundTask(void*) {
     overRun = over ? overRun + 1 : 0;
     bool spikeNow = overRun >= SPIKE_HOLD;      // 100ms 이상 이어진 소리만 인정
     bool newSpike = spikeNow && !inSpike;       // 하나의 소리를 한 번만 셈
+    heldRun = spikeNow ? heldRun + 1 : 0;
+    if (spikeNow && heldRun % 20 == 0) newSpike = true;  // 1초 넘게 이어지면 1초마다 1회 추가
     inSpike = spikeNow;
     // 배경(백색소음) 수준은 천천히 따라감: 급증 중에는 더 느리게
     baseline += (spikeNow ? 0.001f : 0.005f) * (p2p - baseline);
@@ -139,6 +147,12 @@ void soundTask(void*) {
     portENTER_CRITICAL(&sndMux);
     sndSum += p2p; sndSq += p2p * p2p; sndN++;
     if (p2p > sndMax) sndMax = p2p;
+    secSum += p2p;
+    if (++secN >= 20) {                                  // 1초(50ms × 20)마다 평균 저장
+      secLvl[secHead] = secSum / secN; secHead = (secHead + 1) % SEC_RING;
+      if (secFilled < SEC_RING) secFilled++;
+      secSum = 0; secN = 0;
+    }
     if (newSpike) { sndSpikes++; spikeT[spikeHead] = millis(); spikeHead = (spikeHead + 1) % SPK_RING; }
     portEXIT_CRITICAL(&sndMux);
     vTaskDelay(1);
@@ -262,6 +276,15 @@ Features computeFeatures() {
   return f;
 }
 
+// 최근 n초 평균 소리 크기 (실시간)
+float soundLevel(int n) {
+  float s = 0; int c = 0;
+  portENTER_CRITICAL(&sndMux);
+  for (int k = 0; k < min(n, secFilled); k++) { s += secLvl[(secHead - 1 - k + SEC_RING) % SEC_RING]; c++; }
+  portEXIT_CRITICAL(&sndMux);
+  return c ? s / c : 0;
+}
+
 // 최근 ms 밀리초 안의 급증 횟수 (실시간)
 int spikesWithin(uint32_t ms) {
   uint32_t now = millis(); int c = 0;
@@ -372,7 +395,7 @@ void drawLcd() {
     else snprintf(l2, sizeof(l2), "%s", causeLcd.c_str());
   } else {
     // 2화면: 조도 · 소리 / 상태와 1분 급증 횟수
-    snprintf(l1, sizeof(l1), "L%4dlx  S%4d", isnan(lcdLux) ? 0 : (int)lcdLux, isnan(lcdSnd) ? 0 : (int)lcdSnd);
+    snprintf(l1, sizeof(l1), "L%4dlx  S%4d", isnan(lcdLux) ? 0 : (int)lcdLux, (int)soundLevel(5));   // S = 최근 5초 평균 크기
     const char* st[] = {"OPTIMAL", "DROWSY", "DISTRACT"};
     snprintf(l2, sizeof(l2), "%-8s %2d/30s", st[state], lcdSpk);
   }
@@ -389,12 +412,16 @@ void applyOutputs(float co2Now, const Features& f) {
 }
 
 // ───────── 실시간 소음 판단 (0.3초마다) ─────────
-// 켜짐: 최근 30초 급증이 기준(noise30) 이상이 되는 순간 바로
-// 꺼짐: 최근 10초 동안 급증이 한 번도 없으면 바로
+// 켜짐: ① 최근 30초 급증이 기준(noise30) 이상  또는  ② 최근 5초 평균 크기가 loudLvl 이상(계속 시끄러움)
+// 꺼짐: 최근 10초 급증 0회  그리고  5초 평균 크기가 loudLvl의 80% 미만
+bool loudNow = false;
 void updateNoise() {
   int sp30 = spikesWithin(30000), sp10 = spikesWithin(10000);
-  if (!noisy && sp30 >= ctl.noise30) noisy = true;
-  else if (noisy && sp10 == 0) {                    // 10초 조용 → 해제하고 새로 셈
+  float lvl = soundLevel(5);
+  if (!loudNow && lvl >= ctl.loudLvl) loudNow = true;
+  else if (loudNow && lvl < ctl.loudLvl * 0.8f) loudNow = false;
+  if (!noisy && (sp30 >= ctl.noise30 || loudNow)) noisy = true;
+  else if (noisy && sp10 == 0 && !loudNow) {                    // 10초 조용 → 해제하고 새로 셈
     noisy = false;
     portENTER_CRITICAL(&sndMux);
     for (int i = 0; i < SPK_RING; i++) spikeT[i] = 0;
@@ -402,7 +429,8 @@ void updateNoise() {
     sp30 = 0;
   }
   State prev = state;
-  if (noisy) { state = ST_DISTRACTED; causeKo = "말소리·소음 많음"; causeLcd = "NOISY - QUIET"; }
+  if (noisy && loudNow) { state = ST_DISTRACTED; causeKo = "계속 시끄러움";    causeLcd = "LOUD - QUIET"; }
+  else if (noisy)  { state = ST_DISTRACTED; causeKo = "말소리·소음 많음"; causeLcd = "NOISY - QUIET"; }
   else       { state = baseState;     causeKo = baseCauseKo;       causeLcd = baseCauseLcd; }
   digitalWrite(PIN_LED_G, state == ST_OPTIMAL);
   digitalWrite(PIN_LED_Y, state == ST_DROWSY);
@@ -461,6 +489,7 @@ void fetchControl() {
   ctl.hMin      = doc["hMin"]      | ctl.hMin;
   ctl.hMax      = doc["hMax"]      | ctl.hMax;
   ctl.noise30   = doc["noise30"]   | ctl.noise30;
+  ctl.loudLvl   = doc["loudLvl"]   | ctl.loudLvl;
   const char* wm = doc["winMode"] | "auto";
   ctl.winMode = wm;
 }
