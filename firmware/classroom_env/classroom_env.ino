@@ -59,7 +59,7 @@ const int REED_PINS[8] = {13, 14, 18, 19, 32, 33, 5, 15};  // D4는 CO2 PWM이 �
 // ───────── 시간 설정 ─────────
 const uint32_t ENV_READ_MS  = 1000;    // CO2·온습도·조도 측정 주기
 const uint32_t RECORD_MS    = 10000;   // 기록·업로드 주기
-const uint32_t CONTROL_MS   = 30000;   // 원격 설정 읽기 주기
+const uint32_t CONTROL_MS   = 10000;   // 원격 설정 읽기 주기
 const uint32_t WARMUP_S     = 180;     // MH-Z19C 예열 시간
 const int      BUF_N        = 60;      // 10초 × 60 = 최근 10분
 const int      PENDING_MAX  = 90;      // 업로드 실패 시 보관할 기록 수(15분)
@@ -414,7 +414,7 @@ void applyOutputs(float co2Now, const Features& f) {
 // ───────── 실시간 소음 판단 (0.3초마다) ─────────
 // 켜짐: ① 최근 30초 급증이 기준(noise30) 이상  또는  ② 최근 5초 평균 크기가 loudLvl 이상(계속 시끄러움)
 // 꺼짐: 최근 10초 급증 0회  그리고  5초 평균 크기가 loudLvl의 80% 미만
-bool loudNow = false;
+bool loudNow = false, statePush = false;
 void updateNoise() {
   int sp30 = spikesWithin(30000), sp10 = spikesWithin(10000);
   float lvl = soundLevel(5);
@@ -436,7 +436,7 @@ void updateNoise() {
   digitalWrite(PIN_LED_Y, state == ST_DROWSY);
   digitalWrite(PIN_LED_R, state == ST_DISTRACTED);
   lcdSpk = sp30;
-  if (state != prev) { lcdPage = 0; drawLcd(); lastLcd = millis(); }   // 바뀌면 화면도 바로
+  if (state != prev) { lcdPage = 0; drawLcd(); lastLcd = millis(); statePush = true; }   // 바뀌면 화면·웹 바로
 }
 
 // ───────── Firebase (REST) ─────────
@@ -473,6 +473,13 @@ void uploadAll(const String& liveJson) {
   int code = fbRequest("PATCH", "/", body, nullptr);  // 루트("/")에 여러 위치를 한 번에 갱신
   if (code == 200) pendingCount = 0;
   else Serial.printf("[업로드 실패] code=%d, 보관 중 %d개\n", code, pendingCount);
+}
+
+// 상태가 바뀌면 10초 기록을 기다리지 않고 웹에 상태만 바로 올림
+void pushState() {
+  String body = "{\"state_ko\":\"" + String(STATE_KO[state]) + "\",\"cause\":\"" + causeKo +
+                "\",\"rec/state\":" + String((int)state) + "}";
+  fbRequest("PATCH", "/live", body, nullptr);
 }
 
 void fetchControl() {
@@ -627,7 +634,7 @@ void setup() {
   xTaskCreatePinnedToCore(soundTask, "sound", 4096, nullptr, 1, nullptr, 1);
 }
 
-uint32_t lastEnv = 0, lastRec = 0, lastCtl = 0, lastNoise = 0;
+uint32_t lastEnv = 0, lastRec = 0, lastCtl = 0, lastNoise = 0, lastPush = 0;
 
 void loop() {
   uint32_t now = millis();
@@ -636,6 +643,7 @@ void loop() {
   if (now - lastRec >= RECORD_MS)   { lastRec = now; makeRecord(); }
   if (now - lastCtl >= CONTROL_MS)  { lastCtl = now; fetchControl(); }
   if (now - lastNoise >= 300)       { lastNoise = now; updateNoise(); }
+  if (statePush && now - lastPush >= 2000) { statePush = false; lastPush = now; pushState(); }
   if (now - lastLcd >= 3000)        { lastLcd = now; drawLcd(); }
   delay(5);
 }

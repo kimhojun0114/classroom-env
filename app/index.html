@@ -165,9 +165,31 @@ const fmtTime = ts => new Date(ts*1000).toLocaleTimeString("ko-KR",{hour:"2-digi
 
 // ── 실시간 상태 ──
 function setTile(id, v, bad){ const el=$(id); el.querySelector(".v").textContent = v; el.classList.toggle("bad", !!bad); }
+let liveData = null, lastStream = 0;
 async function refreshLive(){
+  try{ liveData = await dbGet("live"); renderLive(); }
+  catch(e){ $("#conn").textContent = "연결 실패 — 주소를 확인하세요"; }
+}
+// 실시간 연결(Firebase 스트리밍): 장치가 값을 올리는 즉시 화면에 반영
+function setPath(obj, path, val){
+  const ks = path.split("/").filter(Boolean);
+  if(!ks.length) return val;
+  obj = obj || {}; let o = obj;
+  ks.slice(0,-1).forEach(k=>{ o[k] = o[k] || {}; o = o[k]; });
+  o[ks[ks.length-1]] = val; return obj;
+}
+function startStream(){
+  if(!window.EventSource) return false;
+  const es = new EventSource(DB_URL + "/live.json");
+  ["put","patch","keep-alive"].forEach(t=>es.addEventListener(t, ()=>{ lastStream = Date.now(); }));
+  es.addEventListener("put", e=>{ const m=JSON.parse(e.data); liveData=setPath(liveData,m.path,m.data); renderLive(); });
+  es.addEventListener("patch", e=>{ const m=JSON.parse(e.data); for(const k in m.data) liveData=setPath(liveData,(m.path+"/"+k),m.data[k]); renderLive(); });
+  es.onerror = ()=>{};   // 끊기면 브라우저가 자동 재연결, 그 사이엔 30초 폴링이 보조
+  return true;
+}
+function renderLive(){
   try{
-    const live = await dbGet("live");
+    const live = liveData;
     if(!live || !live.rec){ $("#conn").textContent = "데이터 없음"; return; }
     const r = live.rec, f = live.feat || {}, age = Date.now()/1000 - r.ts;
     $("#conn").textContent = age > 60 ? `⚠ 장치 응답 없음 (${Math.round(age/60)}분 전 값)` : `업데이트 ${fmtTime(r.ts)}`;
@@ -272,7 +294,9 @@ $("#saveSecret").onclick=()=>{ secret=$("#secret").value.trim(); store.set("fb_s
 
 // ── 시작 ──
 loadControl().then(()=>{ refreshLive(); loadLogs(); loadLabels(); });
-setInterval(refreshLive, 5000);
+startStream();
+// 스트리밍이 40초 넘게 조용하면(막힘·끊김) 5초 폴링으로 보조
+setInterval(()=>{ if(Date.now() - lastStream > 40000) refreshLive(); else renderLive(); }, 5000);
 window.addEventListener("resize", drawChart);
 setInterval(loadLogs, 60000);
 setInterval(()=>{ loadLabels(); }, 60000);
