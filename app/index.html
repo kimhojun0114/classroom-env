@@ -137,6 +137,16 @@ details summary{cursor:pointer;color:var(--sub);font-size:14px}
       <div class="row"><input type="password" id="secret" placeholder="Database secret" style="flex:1"><button class="primary" id="saveSecret" style="width:auto;padding:0 18px;margin:0">저장</button></div>
     </details>
   </section>
+
+  <section class="card wide">
+    <h2>데이터 내려받기 (CSV)</h2>
+    <p class="hint">시작 날짜부터 지금까지의 센서 기록(10초 단위)과 내가 남긴 기록(라벨)을 엑셀에서 열 수 있는 CSV로 받아요.</p>
+    <div class="row"><span class="lab">시작 날짜</span><input type="date" id="csvSince" style="flex:1"></div>
+    <div class="row" style="gap:10px">
+      <button class="primary" id="dlLogs" style="margin:0">센서 기록 받기</button>
+      <button class="primary" id="dlLabels" style="margin:0">라벨 받기</button>
+    </div>
+  </section>
 </main>
 <div id="toast"></div>
 
@@ -291,6 +301,31 @@ $("#saveCtl").onclick=async ()=>{
 async function loadControl(){ try{ const c=await dbGet("control"); if(c) Object.assign(control,c); }catch(e){} showControl(); }
 $("#secret").value = secret;
 $("#saveSecret").onclick=()=>{ secret=$("#secret").value.trim(); store.set("fb_secret",secret); toast("쓰기 키 저장됨"); };
+
+// ── CSV 내려받기 ──
+const LOG_COLS=["time","ts","up","flag","co2","co2_pwm","temp","hum","lux","snd_mean","snd_std","snd_max","snd_spikes","reed","state","vent","win"];
+const LABEL_COLS=["time","ts","focus","drowsy","sleeping","note"];
+const kst = ts => { const d=new Date((ts+9*3600)*1000); return d.toISOString().slice(0,19).replace("T"," "); };
+(function(){ const d=new Date(Date.now()+9*3600e3); $("#csvSince").value=d.toISOString().slice(0,10); })();
+async function downloadCsv(path, cols, btn){
+  const day=$("#csvSince").value; if(!day){ toast("시작 날짜를 고르세요"); return; }
+  const since=Math.floor(new Date(day+"T00:00:00+09:00").getTime()/1000);
+  const old=btn.textContent; btn.textContent="받는 중…"; btn.disabled=true;
+  try{
+    const d=await dbGet(path, `?orderBy=%22$key%22&startAt=%22${since}%22`);
+    const rows=d?Object.values(d).sort((a,b)=>a.ts-b.ts):[];
+    if(!rows.length){ toast("그 날짜 이후 데이터가 없어요"); return; }
+    const esc=v=>{ if(v==null) return ""; v=String(v); return /[",\n]/.test(v)?`"${v.replace(/"/g,'""')}"`:v; };
+    const lines=[cols.join(",")].concat(rows.map(r=>cols.map(c=>esc(c==="time"?kst(r.ts):r[c])).join(",")));
+    const blob=new Blob(["\ufeff"+lines.join("\r\n")],{type:"text/csv;charset=utf-8"});
+    const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+    a.download=`${path}_${day.replace(/-/g,"")}.csv`; document.body.appendChild(a); a.click(); a.remove();
+    toast(`${rows.length}줄 저장됨`);
+  }catch(e){ toast("내려받기 실패: "+e.message); }
+  finally{ btn.textContent=old; btn.disabled=false; }
+}
+$("#dlLogs").onclick=e=>downloadCsv("logs",LOG_COLS,e.target);
+$("#dlLabels").onclick=e=>downloadCsv("labels",LABEL_COLS,e.target);
 
 // ── 시작 ──
 loadControl().then(()=>{ refreshLive(); loadLogs(); loadLabels(); });
