@@ -4,8 +4,14 @@
 #pragma once
 
 // ── 와이파이 ─────────────────────────────
-#define WIFI_SSID   "교실와이파이이름"
-#define WIFI_PASS   "와이파이비밀번호"
+// 여러 개를 넣어 두면 신호가 가장 센 곳에 자동 연결됩니다.
+// 목록에 없는 곳에서는 끊긴 지 1분 뒤 설정용 와이파이 'ENV-<BOARD_NAME>'이 켜지고,
+// 폰/패드로 접속해 그 자리에서 와이파이를 추가할 수 있습니다(장치에 저장, 최대 8개).
+#define WIFI_LIST \
+  {"학교와이파이", "비밀번호"}, \
+  {"집와이파이",   "비밀번호"}
+#define BOARD_NAME "main"          // 설정용 와이파이 이름: ENV-main
+#define PORTAL_KEY "classenv7"     // 관리 비밀번호 겸 설정용 와이파이 비밀번호 (8자 이상)
 
 // ── Firebase Realtime Database ───────────
 // 예: "https://classroom-env-default-rtdb.asia-southeast1.firebasedatabase.app"

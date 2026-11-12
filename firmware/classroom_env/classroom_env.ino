@@ -12,6 +12,10 @@
  */
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Wire.h>
@@ -383,6 +387,7 @@ void lcdLine(int row, const char* s) {
   lcd.setCursor(0, row); lcd.print(b);
 }
 
+extern bool portalOn; extern String apName;   // 와이파이 설정 모드 표시용
 void drawLcd() {
   char l1[17], l2[17];
   uint32_t up = millis() / 1000;
@@ -397,7 +402,8 @@ void drawLcd() {
     // 2화면: 조도 · 소리 / 상태와 1분 급증 횟수
     snprintf(l1, sizeof(l1), "L%4dlx  S%4d", isnan(lcdLux) ? 0 : (int)lcdLux, (int)soundLevel(5));   // S = 최근 5초 평균 크기
     const char* st[] = {"OPTIMAL", "DROWSY", "DISTRACT"};
-    snprintf(l2, sizeof(l2), "%-8s %2d/30s", st[state], lcdSpk);
+    if (portalOn && WiFi.status() != WL_CONNECTED) snprintf(l2, sizeof(l2), "AP %s", apName.c_str());
+    else snprintf(l2, sizeof(l2), "%-8s %2d/30s", st[state], lcdSpk);
   }
   lcdLine(0, l1); lcdLine(1, l2);
   lcdPage = 1 - lcdPage;
@@ -579,14 +585,219 @@ void makeRecord() {
 }
 
 // ───────── 와이파이 ─────────
-uint32_t lastWifiTry = 0;
-void ensureWifi() {
-  if (WiFi.status() == WL_CONNECTED) return;
-  if (millis() - lastWifiTry < 30000) return;
-  lastWifiTry = millis();
-  Serial.println("[WiFi] 재연결 시도");
-  WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+// ───────── 와이파이: 여러 개 자동 연결 + 장치 웹페이지에서 추가 ─────────
+// · 기본 와이파이(config의 WIFI_LIST) 중 신호가 가장 센 곳에 자동 연결
+// · 끊긴 지 1분이 지나면 설정용 와이파이 'ENV-<BOARD_NAME>' 을 켬 → 폰/패드로 접속하면 설정 페이지가 뜸
+// · 연결돼 있을 때는 같은 와이파이에서 http://<장치 IP> 로 들어가도 됨 (IP는 시리얼·LCD에 표시)
+#ifndef WIFI_LIST
+#define WIFI_LIST {WIFI_SSID, WIFI_PASS}
+#endif
+#ifndef BOARD_NAME
+#define BOARD_NAME "main"
+#endif
+#ifndef PORTAL_KEY
+#define PORTAL_KEY "classenv7"   // 관리 비밀번호 겸 설정용 와이파이 비밀번호(8자 이상)
+#endif
+struct WifiCred { const char* ssid; const char* pass; };
+const WifiCred BUILTIN_WIFI[] = { WIFI_LIST };
+const int BUILTIN_COUNT = sizeof(BUILTIN_WIFI) / sizeof(BUILTIN_WIFI[0]);
+const int MAX_SAVED = 8;
+const uint32_t PORTAL_AFTER_MS = 60000;   // 끊긴 지 1분 → 설정 모드
+const uint32_t RETRY_EVERY_MS  = 30000;   // 끊겨 있으면 30초마다 재연결
+
+Preferences wifiPrefs;
+WiFiMulti*  wifiMulti = nullptr;
+WebServer   webServer(80);
+DNSServer   dnsServer;
+String savedSsid[MAX_SAVED], savedPass[MAX_SAVED];
+int savedCount = 0;
+bool portalOn = false, tryNow = false, wasConnected = false;
+uint32_t lostSince = 0, lastRetry = 0;
+String apName = String("ENV-") + BOARD_NAME;
+
+void loadSavedWifi() {
+  wifiPrefs.begin("wifi", true);
+  savedCount = min((int)wifiPrefs.getInt("n", 0), MAX_SAVED);
+  for (int i = 0; i < savedCount; i++) {
+    savedSsid[i] = wifiPrefs.getString(("s" + String(i)).c_str(), "");
+    savedPass[i] = wifiPrefs.getString(("p" + String(i)).c_str(), "");
+  }
+  wifiPrefs.end();
+}
+void writeSavedWifi() {
+  wifiPrefs.begin("wifi", false);
+  wifiPrefs.clear();
+  wifiPrefs.putInt("n", savedCount);
+  for (int i = 0; i < savedCount; i++) {
+    wifiPrefs.putString(("s" + String(i)).c_str(), savedSsid[i]);
+    wifiPrefs.putString(("p" + String(i)).c_str(), savedPass[i]);
+  }
+  wifiPrefs.end();
+}
+void rebuildWifiList() {
+  delete wifiMulti;
+  wifiMulti = new WiFiMulti();
+  for (int i = 0; i < BUILTIN_COUNT; i++) wifiMulti->addAP(BUILTIN_WIFI[i].ssid, BUILTIN_WIFI[i].pass);
+  for (int i = 0; i < savedCount; i++)    wifiMulti->addAP(savedSsid[i].c_str(), savedPass[i].c_str());
+}
+void startPortal() {
+  if (portalOn) return;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(apName.c_str(), PORTAL_KEY);
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  portalOn = true;
+  Serial.printf("[WiFi] 설정 모드: 와이파이 '%s' (비번 %s) 접속 → http://%s\n",
+                apName.c_str(), PORTAL_KEY, WiFi.softAPIP().toString().c_str());
+}
+void stopPortal() {
+  if (!portalOn) return;
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  portalOn = false;
+  Serial.println("[WiFi] 설정 모드 종료");
+}
+bool tryConnect(uint32_t timeoutMs) {
+  Serial.println("[WiFi] 연결 시도...");
+  if (wifiMulti->run(timeoutMs) == WL_CONNECTED) {
+    Serial.printf("[WiFi] 연결됨: %s  IP: %s  (%d dBm)\n",
+                  WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    return true;
+  }
+  Serial.println("[WiFi] 연결 실패");
+  return false;
+}
+
+String htmlEsc(const String& s) {
+  String o;
+  for (char c : s) {
+    if (c == '<') o += "&lt;"; else if (c == '>') o += "&gt;";
+    else if (c == '&') o += "&amp;"; else if (c == '"') o += "&quot;";
+    else o += c;
+  }
+  return o;
+}
+String pageHead(const String& title) {
+  return "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+         "<title>" + title + "</title><style>"
+         "body{font-family:sans-serif;max-width:480px;margin:16px auto;padding:0 12px;color:#222}"
+         ".box{background:#f2f4f7;border-radius:8px;padding:10px 12px;margin:10px 0}"
+         "input{width:100%;padding:9px;margin:4px 0 10px;box-sizing:border-box;font-size:16px}"
+         "button{padding:9px 14px;font-size:15px;border:0;border-radius:6px;background:#2b6cd8;color:#fff}"
+         ".del{background:#d9534f;padding:5px 10px;font-size:13px}"
+         "li{margin:6px 0;display:flex;justify-content:space-between;align-items:center}"
+         "ul{padding-left:0;list-style:none}.muted{color:#888;font-size:13px}"
+         "</style></head><body>";
+}
+void handleRoot() {
+  String h = pageHead("학습환경조절기 WiFi");
+  h += "<h2>학습 환경 조절기 '" + htmlEsc(BOARD_NAME) + "' 와이파이</h2><div class='box'>";
+  if (WiFi.status() == WL_CONNECTED)
+    h += "✅ 연결됨: <b>" + htmlEsc(WiFi.SSID()) + "</b><br>IP " + WiFi.localIP().toString() +
+         " · 신호 " + String(WiFi.RSSI()) + " dBm";
+  else h += "❌ 연결 안 됨";
+  if (portalOn) h += "<br><span class='muted'>설정 모드 켜짐</span>";
+  h += "</div><h3>기본 와이파이</h3><ul>";
+  for (int i = 0; i < BUILTIN_COUNT; i++) h += "<li>" + htmlEsc(BUILTIN_WIFI[i].ssid) + "</li>";
+  h += "</ul><h3>추가한 와이파이 (" + String(savedCount) + "/" + String(MAX_SAVED) + ")</h3><ul>";
+  if (savedCount == 0) h += "<li class='muted'>없음</li>";
+  for (int i = 0; i < savedCount; i++) {
+    h += "<li>" + htmlEsc(savedSsid[i]) +
+         "<form method='POST' action='/del' style='margin:0' onsubmit=\"var k=prompt('관리 비밀번호');"
+         "if(!k)return false;this.key.value=k;\">"
+         "<input type='hidden' name='i' value='" + String(i) + "'>"
+         "<input type='hidden' name='key'><button class='del'>삭제</button></form></li>";
+  }
+  h += "</ul>";
+  int n = WiFi.scanNetworks();
+  h += "<h3>와이파이 추가</h3><form method='POST' action='/add'>"
+       "이름 (SSID)<input name='ssid' list='near' required maxlength='32' autocomplete='off'><datalist id='near'>";
+  for (int i = 0; i < n; i++) h += "<option value=\"" + htmlEsc(WiFi.SSID(i)) + "\">";
+  WiFi.scanDelete();
+  h += "</datalist>비밀번호 (없으면 비워 두기)<input name='pass' type='password' maxlength='63'>"
+       "관리 비밀번호<input name='key' type='password' required>"
+       "<button>저장하고 연결</button></form>"
+       "<p class='muted'>같은 이름을 다시 저장하면 비밀번호가 바뀝니다. 신호가 가장 센 곳에 자동 연결됩니다.</p>"
+       "</body></html>";
+  webServer.send(200, "text/html; charset=utf-8", h);
+}
+void sendMsg(const String& msg) {
+  webServer.send(200, "text/html; charset=utf-8",
+    pageHead("결과") + "<div class='box'>" + msg + "</div><p><a href='/'>← 돌아가기</a></p></body></html>");
+}
+void handleAdd() {
+  if (webServer.arg("key") != PORTAL_KEY) { sendMsg("관리 비밀번호가 틀렸어요."); return; }
+  String ssid = webServer.arg("ssid"); ssid.trim();
+  String pass = webServer.arg("pass");
+  if (ssid.length() == 0 || ssid.length() > 32) { sendMsg("와이파이 이름이 비었거나 너무 길어요."); return; }
+  if (pass.length() > 0 && (pass.length() < 8 || pass.length() > 63)) { sendMsg("비밀번호는 8~63자여야 해요 (없으면 비워 두기)."); return; }
+  for (int i = 0; i < BUILTIN_COUNT; i++)
+    if (ssid == BUILTIN_WIFI[i].ssid) { sendMsg("이미 기본으로 들어 있는 와이파이예요."); return; }
+  int idx = -1;
+  for (int i = 0; i < savedCount; i++) if (savedSsid[i] == ssid) idx = i;
+  if (idx < 0) {
+    if (savedCount >= MAX_SAVED) { sendMsg("최대 개수가 찼어요. 하나 삭제하고 다시 해 주세요."); return; }
+    idx = savedCount++;
+  }
+  savedSsid[idx] = ssid; savedPass[idx] = pass;
+  writeSavedWifi(); rebuildWifiList();
+  if (WiFi.status() != WL_CONNECTED) tryNow = true;
+  Serial.printf("[WiFi] 추가/수정: %s\n", ssid.c_str());
+  sendMsg("저장했어요: <b>" + htmlEsc(ssid) + "</b><br>연결이 안 돼 있으면 바로 연결을 시도해요.");
+}
+void handleDel() {
+  if (webServer.arg("key") != PORTAL_KEY) { sendMsg("관리 비밀번호가 틀렸어요."); return; }
+  int i = webServer.arg("i").toInt();
+  if (i < 0 || i >= savedCount) { sendMsg("잘못된 항목이에요."); return; }
+  String name = savedSsid[i];
+  for (int k = i; k < savedCount - 1; k++) { savedSsid[k] = savedSsid[k + 1]; savedPass[k] = savedPass[k + 1]; }
+  savedCount--;
+  writeSavedWifi(); rebuildWifiList();
+  sendMsg("삭제했어요: <b>" + htmlEsc(name) + "</b>");
+}
+void handleNotFound() {
+  if (portalOn) {
+    webServer.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/", true);
+    webServer.send(302, "text/plain", "");
+  } else webServer.send(404, "text/plain", "not found");
+}
+void wifiBegin() {
+  WiFi.mode(WIFI_STA);
+  loadSavedWifi();
+  rebuildWifiList();
+  Serial.printf("[WiFi] 등록된 와이파이: 기본 %d개 + 추가 %d개\n", BUILTIN_COUNT, savedCount);
+  lcd.setCursor(0, 1); lcd.print("WiFi connecting ");
+  if (tryConnect(20000)) {
+    char b[17]; snprintf(b, sizeof(b), "%-16s", WiFi.localIP().toString().c_str());
+    lcd.setCursor(0, 1); lcd.print(b); delay(1500);   // 장치 IP를 잠깐 보여 줌
+  } else {
+    lostSince = millis() - PORTAL_AFTER_MS;
+    startPortal();
+  }
+  webServer.on("/", HTTP_GET, handleRoot);
+  webServer.on("/add", HTTP_POST, handleAdd);
+  webServer.on("/del", HTTP_POST, handleDel);
+  webServer.onNotFound(handleNotFound);
+  webServer.begin();
+}
+void wifiLoop() {
+  webServer.handleClient();
+  if (portalOn) dnsServer.processNextRequest();
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wasConnected) { wasConnected = true; Serial.printf("[WiFi] 연결됨: %s  IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str()); }
+    lostSince = 0;
+    if (portalOn && WiFi.softAPgetStationNum() == 0) stopPortal();
+    return;
+  }
+  wasConnected = false;
+  if (lostSince == 0) { lostSince = millis(); Serial.println("[WiFi] 연결 끊김"); }
+  if (!portalOn && millis() - lostSince > PORTAL_AFTER_MS) startPortal();
+  bool someoneOnPortal = portalOn && WiFi.softAPgetStationNum() > 0;
+  if (tryNow || (!someoneOnPortal && millis() - lastRetry > RETRY_EVERY_MS)) {
+    tryNow = false; lastRetry = millis();
+    tryConnect(8000);
+  }
 }
 
 // ───────── setup / loop ─────────
@@ -622,9 +833,7 @@ void setup() {
   pinMode(PIN_CO2_PWM, INPUT);
   attachInterrupt(digitalPinToInterrupt(PIN_CO2_PWM), co2PwmISR, CHANGE);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  lastWifiTry = millis();
+  wifiBegin();
   configTzTime("KST-9", "pool.ntp.org", "time.google.com");
 
   // 신호등 점검: 빨-노-초 순서로 한 번씩
@@ -638,7 +847,7 @@ uint32_t lastEnv = 0, lastRec = 0, lastCtl = 0, lastNoise = 0, lastPush = 0;
 
 void loop() {
   uint32_t now = millis();
-  ensureWifi();
+  wifiLoop();
   if (now - lastEnv >= ENV_READ_MS) { lastEnv = now; readEnvOnce(); }
   if (now - lastRec >= RECORD_MS)   { lastRec = now; makeRecord(); }
   if (now - lastCtl >= CONTROL_MS)  { lastCtl = now; fetchControl(); }
