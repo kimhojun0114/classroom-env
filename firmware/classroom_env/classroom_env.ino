@@ -109,6 +109,10 @@ bool shtOk = false, luxOk = false;
 portMUX_TYPE sndMux = portMUX_INITIALIZER_UNLOCKED;
 float sndSum = 0, sndSq = 0, sndMax = 0;
 int   sndN = 0, sndSpikes = 0;
+// 실시간 소음 판정용: 최근 급증 시각(ms) 기록
+const int SPK_RING = 32;
+uint32_t spikeT[SPK_RING] = {0};
+int spikeHead = 0;
 
 void soundTask(void*) {
   float baseline = -1;
@@ -135,7 +139,7 @@ void soundTask(void*) {
     portENTER_CRITICAL(&sndMux);
     sndSum += p2p; sndSq += p2p * p2p; sndN++;
     if (p2p > sndMax) sndMax = p2p;
-    if (newSpike) sndSpikes++;
+    if (newSpike) { sndSpikes++; spikeT[spikeHead] = millis(); spikeHead = (spikeHead + 1) % SPK_RING; }
     portEXIT_CRITICAL(&sndMux);
     vTaskDelay(1);
   }
@@ -258,10 +262,14 @@ Features computeFeatures() {
   return f;
 }
 
-int spikesLast30s() {
-  int s = 0;
-  for (int k = 0; k < min(3, bufCount); k++) s += recAgo(k).sndSpikes;
-  return s;
+// 최근 ms 밀리초 안의 급증 횟수 (실시간)
+int spikesWithin(uint32_t ms) {
+  uint32_t now = millis(); int c = 0;
+  portENTER_CRITICAL(&sndMux);
+  for (int i = 0; i < SPK_RING; i++)
+    if (spikeT[i] && now - spikeT[i] < ms) c++;
+  portEXIT_CRITICAL(&sndMux);
+  return c;
 }
 
 // ───────── 판단 ─────────
@@ -273,6 +281,12 @@ int servoAngle = -1;
 Servo windowServo;
 State state = ST_OPTIMAL;
 String causeKo = "", causeLcd = "OK";
+// 소음을 뺀 나머지 판단 결과 (10초마다 갱신)
+State baseState = ST_OPTIMAL;
+String baseCauseKo = "", baseCauseLcd = "OK";
+uint32_t lastLcd = 0;
+void updateNoise();
+void drawLcd();
 float etaMin = -1;   // 졸음 임계값까지 예상 시간(분), -1 = 해당 없음
 
 #if USE_MLP
@@ -314,31 +328,24 @@ void decide(const Features& f, float co2Now) {
     if (!ventAlert && (co2Now >= ctl.co2Drowsy || (etaMin >= 0 && etaMin <= ctl.etaMin))) ventAlert = true;
     else if (ventAlert && co2Now <= ctl.co2Clear) ventAlert = false;
   }
-  // 2) 소음(산만) 판단: 히스테리시스
-  int sp = spikesLast30s();
-  if (!noisy && sp >= ctl.noise30) noisy = true;
-  else if (noisy && sp <= 2) noisy = false;          // 조용해지면 30초 안에 해제
-
   // 3) 원인 (규칙 기반, 우선순위 순)
   bool luxLow  = !isnan(lcdLux) && lcdLux < ctl.luxLow;   // 최근 10초 조도 기준 (금방 돌아오게)
   bool tHigh   = !isnan(f.temp) && f.temp > ctl.tMax;
   bool tLow    = !isnan(f.temp) && f.temp < ctl.tMin;
   bool hBad    = !isnan(f.hum)  && (f.hum < ctl.hMin || f.hum > ctl.hMax);
 
-  State ruleState = ST_OPTIMAL;
-  if (noisy)            { ruleState = ST_DISTRACTED; causeKo = "말소리·소음 많음";  causeLcd = "NOISY - QUIET"; }
-  else if (ventAlert)   { ruleState = ST_DROWSY;     causeKo = "CO2 상승 - 환기";   causeLcd = "CO2 - VENTILATE"; }
-  else if (luxLow)      { ruleState = ST_DROWSY;     causeKo = "조명 부족";         causeLcd = "LIGHT LOW"; }
-  else if (tHigh)       { ruleState = ST_DROWSY;     causeKo = "온도 높음";         causeLcd = "TEMP HIGH"; }
-  else if (tLow)        { ruleState = ST_DISTRACTED; causeKo = "온도 낮음";         causeLcd = "TEMP LOW"; }
-  else if (hBad)        { ruleState = ST_DISTRACTED; causeKo = "습도 부적절";       causeLcd = "HUMIDITY"; }
-  else                  { causeKo = "";                                            causeLcd = "OK"; }
+  State ruleState = ST_OPTIMAL;   // 소음은 updateNoise()가 0.3초마다 따로 판단
+  if (ventAlert)        { ruleState = ST_DROWSY;     baseCauseKo = "CO2 상승 - 환기";   baseCauseLcd = "CO2 - VENTILATE"; }
+  else if (luxLow)      { ruleState = ST_DROWSY;     baseCauseKo = "조명 부족";         baseCauseLcd = "LIGHT LOW"; }
+  else if (tHigh)       { ruleState = ST_DROWSY;     baseCauseKo = "온도 높음";         baseCauseLcd = "TEMP HIGH"; }
+  else if (tLow)        { ruleState = ST_DISTRACTED; baseCauseKo = "온도 낮음";         baseCauseLcd = "TEMP LOW"; }
+  else if (hBad)        { ruleState = ST_DISTRACTED; baseCauseKo = "습도 부적절";       baseCauseLcd = "HUMIDITY"; }
+  else                  { baseCauseKo = "";                                            baseCauseLcd = "OK"; }
 
 #if USE_MLP
-  state = (State)mlpPredict(f);       // 상태는 인공신경망, 원인 설명은 규칙
-  if (state == ST_OPTIMAL && ruleState != ST_OPTIMAL) { /* 모델은 괜찮다고 판단: 원인은 참고로만 표시 */ }
+  baseState = (State)mlpPredict(f);   // 상태는 인공신경망, 원인 설명은 규칙
 #else
-  state = ruleState;
+  baseState = ruleState;
 #endif
 
   // 4) 창문(서보): 자동이면 환기 알림을 따라감
@@ -374,14 +381,34 @@ void drawLcd() {
 }
 
 void applyOutputs(float co2Now, const Features& f) {
-  digitalWrite(PIN_LED_G, state == ST_OPTIMAL);
-  digitalWrite(PIN_LED_Y, state == ST_DROWSY);
-  digitalWrite(PIN_LED_R, state == ST_DISTRACTED);
   int target = winOpen ? SERVO_OPEN : SERVO_CLOSED;
   if (target != servoAngle) { windowServo.write(target); servoAngle = target; }  // 바뀔 때만 움직임
   const Rec& r = recAgo(0);
   lcdCo2 = co2Now; lcdTemp = r.temp; lcdHum = r.hum; lcdLux = r.lux; lcdSnd = r.sndMean;
-  lcdSpk = spikesLast30s();
+  updateNoise();
+}
+
+// ───────── 실시간 소음 판단 (0.3초마다) ─────────
+// 켜짐: 최근 30초 급증이 기준(noise30) 이상이 되는 순간 바로
+// 꺼짐: 최근 10초 동안 급증이 한 번도 없으면 바로
+void updateNoise() {
+  int sp30 = spikesWithin(30000), sp10 = spikesWithin(10000);
+  if (!noisy && sp30 >= ctl.noise30) noisy = true;
+  else if (noisy && sp10 == 0) {                    // 10초 조용 → 해제하고 새로 셈
+    noisy = false;
+    portENTER_CRITICAL(&sndMux);
+    for (int i = 0; i < SPK_RING; i++) spikeT[i] = 0;
+    portEXIT_CRITICAL(&sndMux);
+    sp30 = 0;
+  }
+  State prev = state;
+  if (noisy) { state = ST_DISTRACTED; causeKo = "말소리·소음 많음"; causeLcd = "NOISY - QUIET"; }
+  else       { state = baseState;     causeKo = baseCauseKo;       causeLcd = baseCauseLcd; }
+  digitalWrite(PIN_LED_G, state == ST_OPTIMAL);
+  digitalWrite(PIN_LED_Y, state == ST_DROWSY);
+  digitalWrite(PIN_LED_R, state == ST_DISTRACTED);
+  lcdSpk = sp30;
+  if (state != prev) { lcdPage = 0; drawLcd(); lastLcd = millis(); }   // 바뀌면 화면도 바로
 }
 
 // ───────── Firebase (REST) ─────────
@@ -571,7 +598,7 @@ void setup() {
   xTaskCreatePinnedToCore(soundTask, "sound", 4096, nullptr, 1, nullptr, 1);
 }
 
-uint32_t lastEnv = 0, lastRec = 0, lastCtl = 0, lastLcd = 0;
+uint32_t lastEnv = 0, lastRec = 0, lastCtl = 0, lastNoise = 0;
 
 void loop() {
   uint32_t now = millis();
@@ -579,6 +606,7 @@ void loop() {
   if (now - lastEnv >= ENV_READ_MS) { lastEnv = now; readEnvOnce(); }
   if (now - lastRec >= RECORD_MS)   { lastRec = now; makeRecord(); }
   if (now - lastCtl >= CONTROL_MS)  { lastCtl = now; fetchControl(); }
+  if (now - lastNoise >= 300)       { lastNoise = now; updateNoise(); }
   if (now - lastLcd >= 3000)        { lastLcd = now; drawLcd(); }
   delay(5);
 }
