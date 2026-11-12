@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 KST = timezone(timedelta(hours=9))
 LOG_COLS = ["time", "ts", "up", "flag", "co2", "temp", "hum", "lux",
-            "snd_mean", "snd_std", "snd_max", "snd_spikes", "reed", "state", "vent", "fan"]
+            "snd_mean", "snd_std", "snd_max", "snd_spikes", "reed", "state", "vent", "win"]
 LABEL_COLS = ["time", "ts", "focus", "drowsy", "sleeping", "note"]
 
 

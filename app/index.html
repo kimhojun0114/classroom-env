@@ -118,8 +118,8 @@ details summary{cursor:pointer;color:var(--sub);font-size:14px}
   <!-- 원격 조절 -->
   <section class="card wide">
     <h2>원격 조절</h2>
-    <div class="row"><span class="lab">환기팬</span>
-      <div class="seg" id="fanSeg"><button data-v="auto">자동</button><button data-v="on">켜기</button><button data-v="off">끄기</button></div>
+    <div class="row"><span class="lab">창문 모형</span>
+      <div class="seg" id="fanSeg"><button data-v="auto">자동</button><button data-v="on">열기</button><button data-v="off">닫기</button></div>
     </div>
     <div class="grid2">
       <label>졸음 임계값 (ppm)<input type="number" id="co2Drowsy" step="50"></label>
@@ -149,7 +149,7 @@ const store = {
   set(k,v){ try { localStorage.setItem(k,v); } catch(e){} }
 };
 let secret = store.get("fb_secret") || "";
-let control = { fanMode:"auto", co2Drowsy:2000, co2Clear:1000, etaMin:10, noiseOn:8, luxMin:300, tMax:28 };
+let control = { winMode:"auto", co2Drowsy:2000, co2Clear:1000, etaMin:10, noiseOn:8, luxMin:300, tMax:28 };
 const label = { focus:null, drowsy:null, sleeping:0 };
 
 function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2200); }
@@ -174,7 +174,7 @@ async function refreshLive(){
     $("#stateKo").textContent = live.state_ko || "–";
     $("#cause").textContent = live.cause ? `원인: ${live.cause}` : "환경이 양호해요";
     $("#eta").textContent = (live.eta_min!=null && live.eta_min < 60) ? `약 ${Math.round(live.eta_min)}분 뒤 졸음 임계값 도달 예상` : "";
-    $("#model").textContent = `판단: ${live.model==="mlp" ? "인공신경망" : "임시 규칙"} · 환기팬 ${r.fan ? "켜짐" : "꺼짐"}${r.flag==="warmup" ? " · CO₂ 센서 예열 중" : ""}`;
+    $("#model").textContent = `판단: ${live.model==="mlp" ? "인공신경망" : "임시 규칙"} · 창문 모형 ${r.win ? "열림" : "닫힘"}${r.flag==="warmup" ? " · CO₂ 센서 예열 중" : ""}`;
     setTile("#tCo2", r.co2 ?? "–", r.co2 >= control.co2Drowsy);
     setTile("#tTemp", r.temp?.toFixed(1) ?? "–", r.temp > control.tMax || r.temp < 18);
     setTile("#tHum", r.hum?.toFixed(0) ?? "–", r.hum < 30 || r.hum > 80);
@@ -256,11 +256,11 @@ function drawChart(){
 const ctlFields=["co2Drowsy","co2Clear","etaMin","noiseOn","luxMin","tMax"];
 function showControl(){
   ctlFields.forEach(k=>$("#"+k).value=control[k]);
-  document.querySelectorAll("#fanSeg button").forEach(b=>b.classList.toggle("sel", b.dataset.v===control.fanMode));
+  document.querySelectorAll("#fanSeg button").forEach(b=>b.classList.toggle("sel", b.dataset.v===control.winMode));
 }
-document.querySelectorAll("#fanSeg button").forEach(b=>b.onclick=()=>{ control.fanMode=b.dataset.v; showControl(); });
+document.querySelectorAll("#fanSeg button").forEach(b=>b.onclick=()=>{ control.winMode=b.dataset.v; showControl(); });
 $("#saveCtl").onclick=async ()=>{
-  const body={ fanMode:control.fanMode };
+  const body={ winMode:control.winMode };
   ctlFields.forEach(k=>{ const v=parseFloat($("#"+k).value); if(!isNaN(v)) body[k]=v; });
   try{ await dbWrite("PATCH","control",body); Object.assign(control,body); toast("설정 저장 — 30초 안에 장치에 반영돼요"); drawChart(); }
   catch(e){ if(e.message!=="no secret") toast("저장 실패: "+e.message); }

@@ -8,7 +8,7 @@
  *  3) 최근 10분 기록으로 특징 8개를 계산해 학습 상태(최적/졸림/산만)를 판단
  *     - USE_MLP 0 : 임시 규칙(데이터 수집 기간용)
  *     - USE_MLP 1 : 학습된 인공신경망(model_weights.h)
- *  4) 신호등 LED · LCD · 환기팬 제어, 웹앱의 원격 설정(/control) 반영
+ *  4) 신호등 LED · LCD · 서보모터(창문 모형) 제어, 웹앱의 원격 설정(/control) 반영
  */
 #include <Arduino.h>
 #include <WiFi.h>
@@ -20,6 +20,7 @@
 #include <BH1750.h>
 #include <LiquidCrystal_I2C.h>
 #include <ArduinoJson.h>
+#include <ESP32Servo.h>
 #include "config.h"
 
 #ifndef USE_MLP
@@ -46,7 +47,9 @@ const int PIN_MIC     = 34;   // MAX4466 OUT (ADC1, 와이파이와 같이 사�
 const int PIN_LED_R   = 25;
 const int PIN_LED_Y   = 26;
 const int PIN_LED_G   = 27;
-const int PIN_FAN     = 23;   // MOSFET/릴레이 모듈 신호선
+const int PIN_SERVO   = 23;   // 서보모터 신호선(주황/노랑)
+const int SERVO_CLOSED = 0;   // 창문 닫힘 각도
+const int SERVO_OPEN   = 90;  // 창문 열림 각도 (모형에 맞게 조정)
 const int PIN_CO2_RX  = 16;   // ESP32 RX2 ← MH-Z19C TX
 const int PIN_CO2_TX  = 17;   // ESP32 TX2 → MH-Z19C RX
 // I2C: SDA 21, SCL 22 (LCD, BH1750, SHT 공유)
@@ -73,7 +76,7 @@ struct Control {
   float tMin = 18, tMax = 28;   // 온도 기준(℃)
   float hMin = 30, hMax = 80;   // 습도 기준(%)
   float noiseOn   = 8;      // 최근 1분 급증 횟수가 이 이상이면 '산만'
-  String fanMode  = "auto"; // auto / on / off
+  String winMode  = "auto"; // 창문(서보): auto / on(열기) / off(닫기)
 } ctl;
 
 // ───────── 상태 ─────────
@@ -227,7 +230,9 @@ int spikesLastMinute() {
 }
 
 // ───────── 판단 ─────────
-bool ventAlert = false, noisy = false, fanOn = false;
+bool ventAlert = false, noisy = false, winOpen = false;
+int servoAngle = -1;
+Servo windowServo;
 State state = ST_OPTIMAL;
 String causeKo = "", causeLcd = "OK";
 float etaMin = -1;   // 졸음 임계값까지 예상 시간(분), -1 = 해당 없음
@@ -298,17 +303,18 @@ void decide(const Features& f, float co2Now) {
   state = ruleState;
 #endif
 
-  // 4) 환기팬
-  if (ctl.fanMode == "on") fanOn = true;
-  else if (ctl.fanMode == "off") fanOn = false;
-  else fanOn = ventAlert;
+  // 4) 창문(서보): 자동이면 환기 알림을 따라감
+  if (ctl.winMode == "on") winOpen = true;
+  else if (ctl.winMode == "off") winOpen = false;
+  else winOpen = ventAlert;
 }
 
 void applyOutputs(float co2Now, const Features& f) {
   digitalWrite(PIN_LED_G, state == ST_OPTIMAL);
   digitalWrite(PIN_LED_Y, state == ST_DROWSY);
   digitalWrite(PIN_LED_R, state == ST_DISTRACTED);
-  digitalWrite(PIN_FAN, fanOn);
+  int target = winOpen ? SERVO_OPEN : SERVO_CLOSED;
+  if (target != servoAngle) { windowServo.write(target); servoAngle = target; }  // 바뀔 때만 움직임
 
   char l1[17], l2[17];
   // 1줄: C2345 23.4C 45%
@@ -375,8 +381,8 @@ void fetchControl() {
   ctl.hMin      = doc["hMin"]      | ctl.hMin;
   ctl.hMax      = doc["hMax"]      | ctl.hMax;
   ctl.noiseOn   = doc["noiseOn"]   | ctl.noiseOn;
-  const char* fm = doc["fanMode"] | "auto";
-  ctl.fanMode = fm;
+  const char* wm = doc["winMode"] | "auto";
+  ctl.winMode = wm;
 }
 
 String jnum(float v, int d = 1) {        // NaN 은 null 로
@@ -434,7 +440,7 @@ void makeRecord() {
     ",\"reed\":\"" + reed + "\"" +
     ",\"state\":" + String((int)state) +
     ",\"vent\":" + (ventAlert ? "true" : "false") +
-    ",\"fan\":" + (fanOn ? "true" : "false") + "}";
+    ",\"win\":" + (winOpen ? "true" : "false") + "}";
 
   String live = "{\"rec\":" + rec +
     ",\"state_ko\":\"" + STATE_KO[state] + "\"" +
@@ -468,7 +474,9 @@ void ensureWifi() {
 void setup() {
   Serial.begin(115200);
   pinMode(PIN_LED_R, OUTPUT); pinMode(PIN_LED_Y, OUTPUT); pinMode(PIN_LED_G, OUTPUT);
-  pinMode(PIN_FAN, OUTPUT); digitalWrite(PIN_FAN, LOW);
+  windowServo.setPeriodHertz(50);
+  windowServo.attach(PIN_SERVO, 500, 2400);
+  windowServo.write(SERVO_CLOSED); servoAngle = SERVO_CLOSED;
   for (int i = 0; i < REED_COUNT; i++) pinMode(REED_PINS[i], INPUT_PULLUP);
 
   analogReadResolution(12);
