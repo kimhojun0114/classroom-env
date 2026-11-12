@@ -173,7 +173,7 @@ async function refreshLive(){
     $("#lr").classList.toggle("on", r.state===2); $("#ly").classList.toggle("on", r.state===1); $("#lg").classList.toggle("on", r.state===0);
     $("#stateKo").textContent = live.state_ko || "–";
     $("#cause").textContent = live.cause ? `원인: ${live.cause}` : "환경이 양호해요";
-    $("#eta").textContent = (live.eta_min!=null && live.eta_min < 60) ? `약 ${Math.round(live.eta_min)}분 뒤 졸음 임계값 도달 예상` : "";
+    $("#eta").textContent = (live.eta_min!=null && live.eta_min >= 0 && live.eta_min < 60) ? `약 ${Math.round(live.eta_min)}분 뒤 졸음 임계값 도달 예상` : "";
     $("#model").textContent = `판단: ${live.model==="mlp" ? "인공신경망" : "임시 규칙"} · 창문 모형 ${r.win ? "열림" : "닫힘"}${r.flag==="warmup" ? " · CO₂ 센서 예열 중" : ""}`;
     setTile("#tCo2", r.co2 ?? "–", r.co2 >= control.co2Drowsy);
     setTile("#tTemp", r.temp?.toFixed(1) ?? "–", r.temp > control.tMax || r.temp < 18);
