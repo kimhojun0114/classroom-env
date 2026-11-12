@@ -30,7 +30,13 @@
 
 ## 1. 배선 (ESP32-WROOM-32 30핀 + 확장보드)
 
+![실물 배선도](docs/wiring_pictorial.png)
+
+<details><summary>연결 관계도 (선 역할별)</summary>
+
 ![배선도](docs/wiring.png)
+
+</details>
 
 | 부품 | 부품 핀 → ESP32 |
 |---|---|
