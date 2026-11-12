@@ -84,7 +84,7 @@ details summary{cursor:pointer;color:var(--sub);font-size:14px}
       <div class="tile" id="tHum"><div class="k">습도</div><span class="v">–</span><span class="u">%</span></div>
       <div class="tile" id="tLux"><div class="k">조도</div><span class="v">–</span><span class="u">lx</span></div>
       <div class="tile" id="tSnd"><div class="k">소리 크기 / 변동</div><span class="v">–</span></div>
-      <div class="tile" id="tSpk"><div class="k">급증(최근 10분)</div><span class="v">–</span><span class="u">회</span></div>
+      <div class="tile" id="tSpk"><div class="k">급증(최근 10분 합계)</div><span class="v">–</span><span class="u">회</span></div>
     </div>
   </section>
 
@@ -125,8 +125,8 @@ details summary{cursor:pointer;color:var(--sub);font-size:14px}
       <label>졸음 임계값 (ppm)<input type="number" id="co2Drowsy" step="50"></label>
       <label>환기 해제 기준 (ppm)<input type="number" id="co2Clear" step="50"></label>
       <label>미리 알림 (분 전)<input type="number" id="etaMin" step="1"></label>
-      <label>소음 기준 (1분 급증 횟수)<input type="number" id="noiseOn" step="1"></label>
-      <label>최소 조도 (lx)<input type="number" id="luxMin" step="10"></label>
+      <label>소음 기준 (30초 급증 횟수)<input type="number" id="noise30" step="1"></label>
+      <label>최소 조도 (lx)<input type="number" id="luxLow" step="10"></label>
       <label>최고 온도 (℃)<input type="number" id="tMax" step="0.5"></label>
     </div>
     <button class="primary" id="saveCtl">설정 저장</button>
@@ -149,7 +149,7 @@ const store = {
   set(k,v){ try { localStorage.setItem(k,v); } catch(e){} }
 };
 let secret = store.get("fb_secret") || "";
-let control = { winMode:"auto", co2Drowsy:2000, co2Clear:1000, etaMin:10, noiseOn:8, luxMin:300, tMax:28 };
+let control = { winMode:"auto", co2Drowsy:2000, co2Clear:1000, etaMin:10, noise30:6, luxLow:100, tMax:28 };
 const label = { focus:null, drowsy:null, sleeping:0 };
 
 function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2200); }
@@ -178,7 +178,7 @@ async function refreshLive(){
     setTile("#tCo2", r.co2 ?? "–", r.co2 >= control.co2Drowsy);
     setTile("#tTemp", r.temp?.toFixed(1) ?? "–", r.temp > control.tMax || r.temp < 18);
     setTile("#tHum", r.hum?.toFixed(0) ?? "–", r.hum < 30 || r.hum > 80);
-    setTile("#tLux", r.lux?.toFixed(0) ?? "–", r.lux < control.luxMin);
+    setTile("#tLux", r.lux?.toFixed(0) ?? "–", r.lux < control.luxLow);
     setTile("#tSnd", `${r.snd_mean?.toFixed(0) ?? "–"} / ${r.snd_std?.toFixed(0) ?? "–"}`);
     setTile("#tSpk", f.snd_spikes ?? "–");
   }catch(e){ $("#conn").textContent = "연결 실패 — 주소를 확인하세요"; }
@@ -253,7 +253,7 @@ function drawChart(){
 }
 
 // ── 원격 조절 ──
-const ctlFields=["co2Drowsy","co2Clear","etaMin","noiseOn","luxMin","tMax"];
+const ctlFields=["co2Drowsy","co2Clear","etaMin","noise30","luxLow","tMax"];
 function showControl(){
   ctlFields.forEach(k=>$("#"+k).value=control[k]);
   document.querySelectorAll("#fanSeg button").forEach(b=>b.classList.toggle("sel", b.dataset.v===control.winMode));

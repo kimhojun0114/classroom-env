@@ -65,19 +65,20 @@ const int      BUF_N        = 60;      // 10초 × 60 = 최근 10분
 const int      PENDING_MAX  = 90;      // 업로드 실패 시 보관할 기록 수(15분)
 
 // ───────── 소리 급증(말소리·충격음) 감지 기준 ─────────
-const float SPIKE_RATIO   = 2.0f;   // 배경 대비 몇 배 이상이면 급증
-const float SPIKE_MIN_ADC = 300.0f; // 배경보다 최소 이만큼(ADC) 커야 급증
-const int   SPIKE_HOLD    = 2;      // 50ms 창이 연속 몇 번 넘어야 소리로 인정 (짧은 전기 잡음 제거)
+const float SPIKE_RATIO   = 3.0f;   // 배경 대비 몇 배 이상이면 급증
+const float SPIKE_MIN_ADC = 400.0f; // 배경보다 최소 이만큼(ADC) 커야 급증
+const int   SPIKE_HOLD    = 3;      // 50ms 창이 연속 3번(150ms) 넘어야 소리로 인정
+                                    // → 키보드·딸깍 같은 짧은 소리와 전기 잡음은 제외, 말소리만 셈
 
 // ───────── 원격 설정 (웹앱 /control 에서 변경 가능) ─────────
 struct Control {
   float co2Drowsy = 2000;   // 졸음 임계값(ppm) — 데이터로 찾은 뒤 웹앱에서 수정
   float co2Clear  = 1000;   // 환기 알림 해제 기준(ppm)
   float etaMin    = 10;     // 임계값 도달 예측 시간이 이 값(분) 이하이면 미리 알림
-  float luxMin    = 300;    // 학교보건법 조도 기준
+  float luxLow    = 100;    // 이보다 어두우면 '조명 부족' (학교보건법 300lx는 웹앱에서 조정)
   float tMin = 18, tMax = 28;   // 온도 기준(℃)
   float hMin = 30, hMax = 80;   // 습도 기준(%)
-  float noiseOn   = 15;     // 최근 1분 급증 횟수가 이 이상이면 '산만'
+  float noise30   = 6;      // 최근 30초 급증 횟수가 이 이상이면 '산만' (2회 이하로 줄면 해제)
   String winMode  = "auto"; // 창문(서보): auto / on(열기) / off(닫기)
 } ctl;
 
@@ -257,13 +258,16 @@ Features computeFeatures() {
   return f;
 }
 
-int spikesLastMinute() {
+int spikesLast30s() {
   int s = 0;
-  for (int k = 0; k < min(6, bufCount); k++) s += recAgo(k).sndSpikes;
+  for (int k = 0; k < min(3, bufCount); k++) s += recAgo(k).sndSpikes;
   return s;
 }
 
 // ───────── 판단 ─────────
+// LCD에 보여줄 최신 값 (10초 기록 때 갱신, 화면은 3초마다 전환)
+float lcdCo2 = NAN, lcdTemp = NAN, lcdHum = NAN, lcdLux = NAN, lcdSnd = NAN;
+int   lcdSpk = 0, lcdPage = 0;
 bool ventAlert = false, noisy = false, winOpen = false;
 int servoAngle = -1;
 Servo windowServo;
@@ -311,12 +315,12 @@ void decide(const Features& f, float co2Now) {
     else if (ventAlert && co2Now <= ctl.co2Clear) ventAlert = false;
   }
   // 2) 소음(산만) 판단: 히스테리시스
-  int sp = spikesLastMinute();
-  if (!noisy && sp >= ctl.noiseOn) noisy = true;
-  else if (noisy && sp <= ctl.noiseOn / 2) noisy = false;
+  int sp = spikesLast30s();
+  if (!noisy && sp >= ctl.noise30) noisy = true;
+  else if (noisy && sp <= 2) noisy = false;          // 조용해지면 30초 안에 해제
 
   // 3) 원인 (규칙 기반, 우선순위 순)
-  bool luxLow  = !isnan(f.lux)  && f.lux < ctl.luxMin;
+  bool luxLow  = !isnan(lcdLux) && lcdLux < ctl.luxLow;   // 최근 10초 조도 기준 (금방 돌아오게)
   bool tHigh   = !isnan(f.temp) && f.temp > ctl.tMax;
   bool tLow    = !isnan(f.temp) && f.temp < ctl.tMin;
   bool hBad    = !isnan(f.hum)  && (f.hum < ctl.hMin || f.hum > ctl.hMax);
@@ -343,9 +347,6 @@ void decide(const Features& f, float co2Now) {
   else winOpen = ventAlert;
 }
 
-// LCD에 보여줄 최신 값 (10초 기록 때 갱신, 화면은 3초마다 전환)
-float lcdCo2 = NAN, lcdTemp = NAN, lcdHum = NAN, lcdLux = NAN, lcdSnd = NAN;
-int   lcdSpk = 0, lcdPage = 0;
 
 void lcdLine(int row, const char* s) {
   char b[17]; snprintf(b, sizeof(b), "%-16s", s);
@@ -366,7 +367,7 @@ void drawLcd() {
     // 2화면: 조도 · 소리 / 상태와 1분 급증 횟수
     snprintf(l1, sizeof(l1), "L%4dlx  S%4d", isnan(lcdLux) ? 0 : (int)lcdLux, isnan(lcdSnd) ? 0 : (int)lcdSnd);
     const char* st[] = {"OPTIMAL", "DROWSY", "DISTRACT"};
-    snprintf(l2, sizeof(l2), "%-8s spk%2d/m", st[state], lcdSpk);
+    snprintf(l2, sizeof(l2), "%-8s %2d/30s", st[state], lcdSpk);
   }
   lcdLine(0, l1); lcdLine(1, l2);
   lcdPage = 1 - lcdPage;
@@ -380,7 +381,7 @@ void applyOutputs(float co2Now, const Features& f) {
   if (target != servoAngle) { windowServo.write(target); servoAngle = target; }  // 바뀔 때만 움직임
   const Rec& r = recAgo(0);
   lcdCo2 = co2Now; lcdTemp = r.temp; lcdHum = r.hum; lcdLux = r.lux; lcdSnd = r.sndMean;
-  lcdSpk = spikesLastMinute();
+  lcdSpk = spikesLast30s();
 }
 
 // ───────── Firebase (REST) ─────────
@@ -427,12 +428,12 @@ void fetchControl() {
   ctl.co2Drowsy = doc["co2Drowsy"] | ctl.co2Drowsy;
   ctl.co2Clear  = doc["co2Clear"]  | ctl.co2Clear;
   ctl.etaMin    = doc["etaMin"]    | ctl.etaMin;
-  ctl.luxMin    = doc["luxMin"]    | ctl.luxMin;
+  ctl.luxLow    = doc["luxLow"]    | ctl.luxLow;
   ctl.tMin      = doc["tMin"]      | ctl.tMin;
   ctl.tMax      = doc["tMax"]      | ctl.tMax;
   ctl.hMin      = doc["hMin"]      | ctl.hMin;
   ctl.hMax      = doc["hMax"]      | ctl.hMax;
-  ctl.noiseOn   = doc["noiseOn"]   | ctl.noiseOn;
+  ctl.noise30   = doc["noise30"]   | ctl.noise30;
   const char* wm = doc["winMode"] | "auto";
   ctl.winMode = wm;
 }
@@ -471,6 +472,7 @@ void makeRecord() {
   bufHead = (bufHead + 1) % BUF_N;
   if (bufCount < BUF_N) bufCount++;
 
+  lcdLux = r.lux;
   Features f = computeFeatures();
   decide(f, r.co2);
   applyOutputs(r.co2, f);
