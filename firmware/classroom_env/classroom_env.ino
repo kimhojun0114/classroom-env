@@ -66,7 +66,8 @@ const int      PENDING_MAX  = 90;      // 업로드 실패 시 보관할 기록 
 
 // ───────── 소리 급증(말소리·충격음) 감지 기준 ─────────
 const float SPIKE_RATIO   = 2.0f;   // 배경 대비 몇 배 이상이면 급증
-const float SPIKE_MIN_ADC = 150.0f; // 배경보다 최소 이만큼(ADC) 커야 급증
+const float SPIKE_MIN_ADC = 300.0f; // 배경보다 최소 이만큼(ADC) 커야 급증
+const int   SPIKE_HOLD    = 2;      // 50ms 창이 연속 몇 번 넘어야 소리로 인정 (짧은 전기 잡음 제거)
 
 // ───────── 원격 설정 (웹앱 /control 에서 변경 가능) ─────────
 struct Control {
@@ -76,7 +77,7 @@ struct Control {
   float luxMin    = 300;    // 학교보건법 조도 기준
   float tMin = 18, tMax = 28;   // 온도 기준(℃)
   float hMin = 30, hMax = 80;   // 습도 기준(%)
-  float noiseOn   = 8;      // 최근 1분 급증 횟수가 이 이상이면 '산만'
+  float noiseOn   = 15;     // 최근 1분 급증 횟수가 이 이상이면 '산만'
   String winMode  = "auto"; // 창문(서보): auto / on(열기) / off(닫기)
 } ctl;
 
@@ -111,6 +112,7 @@ int   sndN = 0, sndSpikes = 0;
 void soundTask(void*) {
   float baseline = -1;
   bool inSpike = false;
+  int  overRun = 0;
   for (;;) {
     int mn = 4095, mx = 0;
     uint32_t t0 = millis();
@@ -121,7 +123,9 @@ void soundTask(void*) {
     }
     float p2p = mx - mn;
     if (baseline < 0) baseline = p2p;
-    bool spikeNow = (p2p > baseline * SPIKE_RATIO) && (p2p - baseline > SPIKE_MIN_ADC);
+    bool over = (p2p > baseline * SPIKE_RATIO) && (p2p - baseline > SPIKE_MIN_ADC);
+    overRun = over ? overRun + 1 : 0;
+    bool spikeNow = overRun >= SPIKE_HOLD;      // 100ms 이상 이어진 소리만 인정
     bool newSpike = spikeNow && !inSpike;       // 하나의 소리를 한 번만 셈
     inSpike = spikeNow;
     // 배경(백색소음) 수준은 천천히 따라감: 급증 중에는 더 느리게
@@ -339,26 +343,44 @@ void decide(const Features& f, float co2Now) {
   else winOpen = ventAlert;
 }
 
+// LCD에 보여줄 최신 값 (10초 기록 때 갱신, 화면은 3초마다 전환)
+float lcdCo2 = NAN, lcdTemp = NAN, lcdHum = NAN, lcdLux = NAN, lcdSnd = NAN;
+int   lcdSpk = 0, lcdPage = 0;
+
+void lcdLine(int row, const char* s) {
+  char b[17]; snprintf(b, sizeof(b), "%-16s", s);
+  lcd.setCursor(0, row); lcd.print(b);
+}
+
+void drawLcd() {
+  char l1[17], l2[17];
+  uint32_t up = millis() / 1000;
+  if (lcdPage == 0) {
+    // 1화면: CO2 · 온도 · 습도 / 원인 또는 환기 예상
+    if (up < WARMUP_S) snprintf(l1, sizeof(l1), "CO2 warm %lu:%02lu", (unsigned long)(WARMUP_S - up) / 60, (unsigned long)(WARMUP_S - up) % 60);
+    else snprintf(l1, sizeof(l1), "C%-4d %4.1fC %2d%%", isnan(lcdCo2) ? 0 : (int)lcdCo2,
+                  isnan(lcdTemp) ? 0.0 : lcdTemp, isnan(lcdHum) ? 0 : (int)lcdHum);
+    if (causeLcd == "OK" && etaMin >= 0 && etaMin < 60) snprintf(l2, sizeof(l2), "OK  vent in %2dm", (int)etaMin);
+    else snprintf(l2, sizeof(l2), "%s", causeLcd.c_str());
+  } else {
+    // 2화면: 조도 · 소리 / 상태와 1분 급증 횟수
+    snprintf(l1, sizeof(l1), "L%4dlx  S%4d", isnan(lcdLux) ? 0 : (int)lcdLux, isnan(lcdSnd) ? 0 : (int)lcdSnd);
+    const char* st[] = {"OPTIMAL", "DROWSY", "DISTRACT"};
+    snprintf(l2, sizeof(l2), "%-8s spk%2d/m", st[state], lcdSpk);
+  }
+  lcdLine(0, l1); lcdLine(1, l2);
+  lcdPage = 1 - lcdPage;
+}
+
 void applyOutputs(float co2Now, const Features& f) {
   digitalWrite(PIN_LED_G, state == ST_OPTIMAL);
   digitalWrite(PIN_LED_Y, state == ST_DROWSY);
   digitalWrite(PIN_LED_R, state == ST_DISTRACTED);
   int target = winOpen ? SERVO_OPEN : SERVO_CLOSED;
   if (target != servoAngle) { windowServo.write(target); servoAngle = target; }  // 바뀔 때만 움직임
-
-  char l1[17], l2[17];
-  // 1줄: C2345 23.4C 45%
-  snprintf(l1, sizeof(l1), "C%-4d %4.1fC %2d%%",
-           isnan(co2Now) ? 0 : (int)co2Now,
-           isnan(f.temp) ? 0.0 : f.temp,
-           isnan(f.hum) ? 0 : (int)f.hum);
-  // 2줄: 원인, 또는 환기 예상 시간
-  if (causeLcd == "OK" && etaMin >= 0 && etaMin < 60)
-    snprintf(l2, sizeof(l2), "OK  vent in %2dm", (int)etaMin);
-  else
-    snprintf(l2, sizeof(l2), "%-16s", causeLcd.c_str());
-  lcd.setCursor(0, 0); lcd.print(l1); for (int i = strlen(l1); i < 16; i++) lcd.print(' ');
-  lcd.setCursor(0, 1); lcd.print(l2);
+  const Rec& r = recAgo(0);
+  lcdCo2 = co2Now; lcdTemp = r.temp; lcdHum = r.hum; lcdLux = r.lux; lcdSnd = r.sndMean;
+  lcdSpk = spikesLastMinute();
 }
 
 // ───────── Firebase (REST) ─────────
@@ -547,7 +569,7 @@ void setup() {
   xTaskCreatePinnedToCore(soundTask, "sound", 4096, nullptr, 1, nullptr, 1);
 }
 
-uint32_t lastEnv = 0, lastRec = 0, lastCtl = 0;
+uint32_t lastEnv = 0, lastRec = 0, lastCtl = 0, lastLcd = 0;
 
 void loop() {
   uint32_t now = millis();
@@ -555,5 +577,6 @@ void loop() {
   if (now - lastEnv >= ENV_READ_MS) { lastEnv = now; readEnvOnce(); }
   if (now - lastRec >= RECORD_MS)   { lastRec = now; makeRecord(); }
   if (now - lastCtl >= CONTROL_MS)  { lastCtl = now; fetchControl(); }
+  if (now - lastLcd >= 3000)        { lastLcd = now; drawLcd(); }
   delay(5);
 }
