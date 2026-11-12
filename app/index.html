@@ -220,7 +220,10 @@ function renderLive(){
 // ── 라벨 입력 ──
 document.querySelectorAll(".seg[data-key]").forEach(seg=>{
   for(let i=1;i<=5;i++){ const b=document.createElement("button"); b.textContent=i;
-    b.onclick=()=>{ label[seg.dataset.key]=i; seg.querySelectorAll("button").forEach(x=>x.classList.toggle("sel", x===b)); checkReady(); };
+    b.onclick=()=>{ const k=seg.dataset.key;
+      if(label[k]===i){ label[k]=null; b.classList.remove("sel"); }          // 선택된 걸 다시 누르면 해제
+      else { label[k]=i; seg.querySelectorAll("button").forEach(x=>x.classList.toggle("sel", x===b)); }
+      checkReady(); };
     seg.appendChild(b); }
 });
 function checkReady(){ $("#saveLabel").disabled = !(label.focus && label.drowsy); }
