@@ -392,7 +392,7 @@ void uploadAll(const String& liveJson) {
   String body = "{\"live\":" + liveJson;
   for (int i = 0; i < pendingCount; i++) body += "," + pending[i];
   body += "}";
-  int code = fbRequest("PATCH", "", body, nullptr);   // 여러 위치를 한 번에 갱신
+  int code = fbRequest("PATCH", "/", body, nullptr);  // 루트("/")에 여러 위치를 한 번에 갱신
   if (code == 200) pendingCount = 0;
   else Serial.printf("[업로드 실패] code=%d, 보관 중 %d개\n", code, pendingCount);
 }
