@@ -48,6 +48,9 @@ main{max-width:1080px;margin:0 auto;padding:0 16px 40px;display:grid;gap:14px;gr
 .primary:disabled{opacity:.5}
 #lastLabel{margin-top:10px;font-size:14px}
 #lastLabel.late{color:var(--red);font-weight:700}
+.wlist{list-style:none;padding:0;margin:8px 0}
+.wlist li{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)}
+.wlist button{height:34px;padding:0 12px;border-radius:8px;border:1px solid var(--line);background:var(--chip);color:var(--ink);cursor:pointer}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
 .grid2 label{font-size:13px;color:var(--sub);display:flex;flex-direction:column;gap:4px}
 input[type=number],input[type=password],input[type=text]{height:40px;border-radius:8px;border:1px solid var(--line);background:var(--chip);color:var(--ink);padding:0 10px;font-size:15px;width:100%}
@@ -136,6 +139,17 @@ details summary{cursor:pointer;color:var(--sub);font-size:14px}
       <p class="hint">기록 저장과 원격 조절에는 Firebase 데이터베이스 비밀번호가 필요해요. 이 기기 브라우저에만 저장되고 깃허브에는 올라가지 않아요.</p>
       <div class="row"><input type="password" id="secret" placeholder="Database secret" style="flex:1"><button class="primary" id="saveSecret" style="width:auto;padding:0 18px;margin:0">저장</button></div>
     </details>
+  </section>
+
+  <section class="card wide">
+    <h2>장치 와이파이 관리</h2>
+    <p class="hint">여기서 추가한 와이파이는 장치가 인터넷에 연결돼 있을 때 1분 안에 장치로 전달·저장돼요. 그다음 그 장소에 가면 자동으로 연결돼요. (최대 8개, 쓰기 키 필요 · 비밀번호는 쓰기 키 없이는 읽을 수 없어요)</p>
+    <ul id="wifiList" class="wlist"></ul>
+    <div class="grid2">
+      <label>와이파이 이름 (SSID)<input id="wSsid" autocomplete="off" maxlength="32"></label>
+      <label>비밀번호 (없으면 비워 두기)<input id="wPass" type="password" maxlength="63"></label>
+    </div>
+    <button class="primary" id="wAdd">와이파이 추가</button>
   </section>
 
   <section class="card wide">
@@ -303,7 +317,41 @@ $("#saveCtl").onclick=async ()=>{
 };
 async function loadControl(){ try{ const c=await dbGet("control"); if(c) Object.assign(control,c); }catch(e){} showControl(); }
 $("#secret").value = secret;
-$("#saveSecret").onclick=()=>{ secret=$("#secret").value.trim(); store.set("fb_secret",secret); toast("쓰기 키 저장됨"); };
+$("#saveSecret").onclick=()=>{ secret=$("#secret").value.trim(); store.set("fb_secret",secret); toast("쓰기 키 저장됨"); loadWifi(); };
+
+// ── 장치 와이파이 관리 (/wifi, 쓰기 키로만 읽고 씀) ──
+async function loadWifi(){
+  const ul=$("#wifiList");
+  if(!secret){ ul.innerHTML='<li class="hint">아래 원격 조절의 \'쓰기 키\'를 먼저 저장하세요</li>'; return; }
+  try{
+    const d=await dbGet("wifi", `?auth=${encodeURIComponent(secret)}`) || {};
+    const keys=Object.keys(d);
+    ul.innerHTML = keys.length ? "" : '<li class="hint">추가한 와이파이 없음 (기본: 학교 7반 · 집 · 컴퓨터실)</li>';
+    keys.forEach(k=>{
+      const li=document.createElement("li");
+      const nm=document.createElement("span"); nm.textContent=d[k].ssid; li.appendChild(nm);
+      const b=document.createElement("button"); b.textContent="삭제";
+      b.onclick=async()=>{ if(!confirm(`'${d[k].ssid}' 삭제할까요?`)) return;
+        try{ await dbWrite("DELETE","wifi/"+k); toast("삭제됨 — 1분 안에 장치에 반영"); loadWifi(); }catch(e){ if(e.message!=="no secret") toast("삭제 실패: "+e.message); } };
+      li.appendChild(b); ul.appendChild(li);
+    });
+    window._wifiCount=keys.length; window._wifi=d;
+  }catch(e){ ul.innerHTML='<li class="hint">불러오기 실패 — 쓰기 키나 데이터베이스 규칙을 확인하세요</li>'; }
+}
+$("#wAdd").onclick=async()=>{
+  const ssid=$("#wSsid").value.trim(), pass=$("#wPass").value;
+  if(!ssid || ssid.length>32){ toast("와이파이 이름을 확인하세요"); return; }
+  if(pass && (pass.length<8 || pass.length>63)){ toast("비밀번호는 8~63자 (없으면 비워 두기)"); return; }
+  const d=window._wifi||{};
+  const same=Object.keys(d).find(k=>d[k].ssid===ssid);
+  if(!same && (window._wifiCount||0)>=8){ toast("최대 8개예요. 하나 삭제하고 추가하세요"); return; }
+  try{
+    if(same) await dbWrite("PUT","wifi/"+same,{ssid,pass});
+    else await dbWrite("POST","wifi",{ssid,pass});
+    $("#wSsid").value=""; $("#wPass").value="";
+    toast(same?"비밀번호 변경됨 — 1분 안에 장치에 반영":"추가됨 — 1분 안에 장치에 반영"); loadWifi();
+  }catch(e){ if(e.message!=="no secret") toast("추가 실패: "+e.message); }
+};
 
 // ── CSV 내려받기 ──
 const LOG_COLS=["time","ts","up","flag","co2","co2_pwm","temp","hum","lux","snd_mean","snd_std","snd_max","snd_spikes","reed","state","vent","win"];
@@ -331,7 +379,7 @@ $("#dlLogs").onclick=e=>downloadCsv("logs",LOG_COLS,e.target);
 $("#dlLabels").onclick=e=>downloadCsv("labels",LABEL_COLS,e.target);
 
 // ── 시작 ──
-loadControl().then(()=>{ refreshLive(); loadLogs(); loadLabels(); });
+loadControl().then(()=>{ refreshLive(); loadLogs(); loadLabels(); loadWifi(); });
 startStream();
 // 스트리밍이 40초 넘게 조용하면(막힘·끊김) 5초 폴링으로 보조
 setInterval(()=>{ if(Date.now() - lastStream > 40000) refreshLive(); else renderLive(); }, 5000);

@@ -387,7 +387,6 @@ void lcdLine(int row, const char* s) {
   lcd.setCursor(0, row); lcd.print(b);
 }
 
-extern bool portalOn; extern String apName;   // 와이파이 설정 모드 표시용
 void drawLcd() {
   char l1[17], l2[17];
   uint32_t up = millis() / 1000;
@@ -402,8 +401,7 @@ void drawLcd() {
     // 2화면: 조도 · 소리 / 상태와 1분 급증 횟수
     snprintf(l1, sizeof(l1), "L%4dlx  S%4d", isnan(lcdLux) ? 0 : (int)lcdLux, (int)soundLevel(5));   // S = 최근 5초 평균 크기
     const char* st[] = {"OPTIMAL", "DROWSY", "DISTRACT"};
-    if (portalOn && WiFi.status() != WL_CONNECTED) snprintf(l2, sizeof(l2), "AP %s", apName.c_str());
-    else snprintf(l2, sizeof(l2), "%-8s %2d/30s", st[state], lcdSpk);
+    snprintf(l2, sizeof(l2), "%-8s %2d/30s", st[state], lcdSpk);
   }
   lcdLine(0, l1); lcdLine(1, l2);
   lcdPage = 1 - lcdPage;
@@ -586,9 +584,10 @@ void makeRecord() {
 
 // ───────── 와이파이 ─────────
 // ───────── 와이파이: 여러 개 자동 연결 + 장치 웹페이지에서 추가 ─────────
-// · 기본 와이파이(config의 WIFI_LIST) 중 신호가 가장 센 곳에 자동 연결
-// · 끊긴 지 1분이 지나면 설정용 와이파이 'ENV-<BOARD_NAME>' 을 켬 → 폰/패드로 접속하면 설정 페이지가 뜸
-// · 연결돼 있을 때는 같은 와이파이에서 http://<장치 IP> 로 들어가도 됨 (IP는 시리얼·LCD에 표시)
+// · 기본 와이파이(config의 WIFI_LIST) + 웹앱에서 추가한 와이파이 중 신호가 가장 센 곳에 자동 연결
+// · 웹앱 '와이파이 관리'에서 추가 → Firebase /wifi (쓰기 키 없이는 읽을 수 없음)
+//   → 장치가 연결돼 있을 때 1분마다 받아서 내부(Preferences)에 저장 → 다음에 그곳에 가면 자동 연결
+// · 비상용: 끊긴 지 1분이 지나면 설정용 와이파이 'ENV-<BOARD_NAME>' 을 켬 → 접속하면 설정 페이지
 #ifndef WIFI_LIST
 #define WIFI_LIST {WIFI_SSID, WIFI_PASS}
 #endif
@@ -762,16 +761,38 @@ void handleNotFound() {
     webServer.send(302, "text/plain", "");
   } else webServer.send(404, "text/plain", "not found");
 }
+// 웹앱에서 관리하는 와이파이 목록(/wifi)을 받아 장치에 저장
+int fbRequest(const char* method, const String& path, const String& body, String* resp);
+void syncWifiFromCloud() {
+  String body;
+  if (fbRequest("GET", "/wifi", "", &body) != 200) return;
+  String ns[MAX_SAVED], np[MAX_SAVED]; int n = 0;
+  if (body != "null") {
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) return;
+    for (JsonPair kv : doc.as<JsonObject>()) {
+      if (n >= MAX_SAVED) break;
+      const char* ss = kv.value()["ssid"] | "";
+      const char* pp = kv.value()["pass"] | "";
+      if (!*ss) continue;
+      ns[n] = ss; np[n] = pp; n++;
+    }
+  }
+  bool same = (n == savedCount);
+  for (int i = 0; same && i < n; i++) same = (ns[i] == savedSsid[i] && np[i] == savedPass[i]);
+  if (same) return;
+  for (int i = 0; i < n; i++) { savedSsid[i] = ns[i]; savedPass[i] = np[i]; }
+  savedCount = n;
+  writeSavedWifi(); rebuildWifiList();
+  Serial.printf("[WiFi] 웹앱 와이파이 목록 반영: %d개\n", n);
+}
+
 void wifiBegin() {
   WiFi.mode(WIFI_STA);
   loadSavedWifi();
   rebuildWifiList();
   Serial.printf("[WiFi] 등록된 와이파이: 기본 %d개 + 추가 %d개\n", BUILTIN_COUNT, savedCount);
-  lcd.setCursor(0, 1); lcd.print("WiFi connecting ");
-  if (tryConnect(20000)) {
-    char b[17]; snprintf(b, sizeof(b), "%-16s", WiFi.localIP().toString().c_str());
-    lcd.setCursor(0, 1); lcd.print(b); delay(1500);   // 장치 IP를 잠깐 보여 줌
-  } else {
+  if (!tryConnect(20000)) {
     lostSince = millis() - PORTAL_AFTER_MS;
     startPortal();
   }
@@ -843,7 +864,7 @@ void setup() {
   xTaskCreatePinnedToCore(soundTask, "sound", 4096, nullptr, 1, nullptr, 1);
 }
 
-uint32_t lastEnv = 0, lastRec = 0, lastCtl = 0, lastNoise = 0, lastPush = 0;
+uint32_t lastEnv = 0, lastRec = 0, lastCtl = 0, lastNoise = 0, lastPush = 0, lastWifiSync = 0;
 
 void loop() {
   uint32_t now = millis();
@@ -851,6 +872,7 @@ void loop() {
   if (now - lastEnv >= ENV_READ_MS) { lastEnv = now; readEnvOnce(); }
   if (now - lastRec >= RECORD_MS)   { lastRec = now; makeRecord(); }
   if (now - lastCtl >= CONTROL_MS)  { lastCtl = now; fetchControl(); }
+  if (WiFi.status() == WL_CONNECTED && (lastWifiSync == 0 || now - lastWifiSync >= 60000)) { lastWifiSync = now ? now : 1; syncWifiFromCloud(); }
   if (now - lastNoise >= 300)       { lastNoise = now; updateNoise(); }
   if (statePush && now - lastPush >= 2000) { statePush = false; lastPush = now; pushState(); }
   if (now - lastLcd >= 3000)        { lastLcd = now; drawLcd(); }
