@@ -54,7 +54,7 @@ const int PIN_CO2_RX  = 16;   // ESP32 RX2 ← MH-Z19C TX
 const int PIN_CO2_TX  = 17;   // ESP32 TX2 → MH-Z19C RX
 const int PIN_CO2_PWM = 4;    // MH-Z19C PWM 출력 (UART 값 검증용)
 // I2C: SDA 21, SCL 22 (LCD, BH1750, SHT 공유)
-const int REED_PINS[8] = {13, 14, 18, 19, 32, 33, 4, 5};
+const int REED_PINS[8] = {13, 14, 18, 19, 32, 33, 5, 15};  // D4는 CO2 PWM이 사용
 
 // ───────── 시간 설정 ─────────
 const uint32_t ENV_READ_MS  = 1000;    // CO2·온습도·조도 측정 주기
