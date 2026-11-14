@@ -354,7 +354,7 @@ $("#wAdd").onclick=async()=>{
 };
 
 // ── CSV 내려받기 ──
-const LOG_COLS=["time","ts","up","flag","co2","co2_pwm","temp","hum","lux","snd_mean","snd_std","snd_max","snd_spikes","reed","state","vent","win"];
+const LOG_COLS=["time","ts","up","flag","co2","co2_pwm","temp","hum","lux","snd_mean","snd_std","snd_max","snd_spikes","snd_sp","snd_flat","snd_cent","reed","state","vent","win"];
 const LABEL_COLS=["time","ts","focus","drowsy","sleeping","note"];
 const kst = ts => { const d=new Date((ts+9*3600)*1000); return d.toISOString().slice(0,19).replace("T"," "); };
 (function(){ const d=new Date(Date.now()+9*3600e3); $("#csvSince").value=d.toISOString().slice(0,10); })();

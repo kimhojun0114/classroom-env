@@ -3,7 +3,7 @@
  * 20713 김호준 · 인공지능 융합 프로젝트
  *
  * 하는 일
- *  1) 소리(MAX4466)는 50ms 창 단위로 계속 측정, CO2(UART·PWM 두 방식)·온습도·조도는 1초마다 측정
+ *  1) 소리(MAX4466)는 50ms 창 단위로 계속 측정(8kHz 샘플링 + FFT로 주파수 특징 계산), CO2(UART·PWM 두 방식)·온습도·조도는 1초마다 측정
  *  2) 10초마다 평균을 내서 하나의 기록으로 만들고 Firebase 에 업로드
  *  3) 최근 10분 기록으로 특징 8개를 계산해 학습 상태(최적/졸림/산만)를 판단
  *     - USE_MLP 0 : 임시 규칙(데이터 수집 기간용)
@@ -96,6 +96,7 @@ struct Rec {
   float sndMean, sndStd, sndMax;
   int   sndSpikes;
   float co2, co2pwm, temp, hum, lux;
+  float sndSp, sndFlat, sndCent;    // 주파수 특징
 };
 Rec buf[BUF_N];
 int bufCount = 0, bufHead = 0;   // bufHead = 다음에 쓸 위치
@@ -123,20 +124,85 @@ const int SEC_RING = 10;
 float secLvl[SEC_RING] = {0};
 int secHead = 0, secFilled = 0;
 
+// ───────── 주파수 분석 (FFT) ─────────
+// 8kHz로 256개(32ms)를 모아 FFT → 소리 종류를 구분하는 특징 3개
+//  · snd_sp   : 말소리 대역(300~3000Hz) 에너지 비율 (말소리↑)
+//  · snd_flat : 스펙트럼 평탄도 0~1 (백색소음·환풍기↑, 말소리·음악↓)
+//  · snd_cent : 스펙트럼 중심 Hz (키보드·딸깍 같은 높은 소리↑)
+// 10초 기록에는 '소리 에너지로 가중 평균'해서 저장 → 큰 소리가 날 때의 특징이 주로 반영됨
+const int      FFT_N     = 256;
+const uint32_t SAMPLE_US = 125;          // 8000Hz
+float fRe[FFT_N], fIm[FFT_N], hannW[FFT_N];
+double specW = 0, specSp = 0, specFl = 0, specCt = 0;   // sndMux 로 보호
+
+void fftInPlace(float* re, float* im, int n) {
+  for (int i = 1, j = 0; i < n; i++) {                 // 비트 뒤집기 정렬
+    int bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { float t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (int len = 2; len <= n; len <<= 1) {             // 나비 연산
+    float ang = -2.0f * (float)M_PI / len, wr = cosf(ang), wi = sinf(ang);
+    for (int i = 0; i < n; i += len) {
+      float cr = 1, ci = 0;
+      for (int k = 0; k < len / 2; k++) {
+        int a = i + k, b = i + k + len / 2;
+        float vr = re[b] * cr - im[b] * ci, vi = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - vr; im[b] = im[a] - vi;
+        re[a] += vr;        im[a] += vi;
+        float t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+      }
+    }
+  }
+}
+
+// x[0..FFT_N) 원신호, fs 샘플링 주파수 → 특징 3개. 소리가 거의 없으면 false
+bool specFeatures(float* x, float fs, float& sp, float& fl, float& ct) {
+  float mean = 0;
+  for (int i = 0; i < FFT_N; i++) mean += x[i];
+  mean /= FFT_N;
+  for (int i = 0; i < FFT_N; i++) { fRe[i] = (x[i] - mean) * hannW[i]; fIm[i] = 0; }
+  fftInPlace(fRe, fIm, FFT_N);
+  float binHz = fs / FFT_N;
+  double tot = 0, spE = 0, wsum = 0, logSum = 0; int m = 0;
+  for (int k = 1; k < FFT_N / 2; k++) {
+    float f = k * binHz;
+    if (f < 60) continue;                               // 전원 험·직류 성분 제외
+    double P = (double)fRe[k] * fRe[k] + (double)fIm[k] * fIm[k];
+    tot += P; wsum += P * f;
+    if (f >= 300 && f <= 3000) spE += P;
+    logSum += log(P + 1e-6); m++;
+  }
+  if (tot < 1e-3 || m == 0) return false;
+  sp = spE / tot;
+  ct = wsum / tot;
+  fl = exp(logSum / m) / (tot / m);                     // 기하평균 / 산술평균
+  return true;
+}
+
 void soundTask(void*) {
+  for (int i = 0; i < FFT_N; i++) hannW[i] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * i / (FFT_N - 1));
   float baseline = -1;
   bool inSpike = false;
   int  overRun = 0, heldRun = 0, secN = 0;
   float secSum = 0;
   for (;;) {
-    int mn = 4095, mx = 0;
-    uint32_t t0 = millis();
-    while (millis() - t0 < 50) {               // 50ms 동안 최댓값-최솟값 = 진폭
+    int mn = 4095, mx = 0, ns = 0;
+    static float raw[FFT_N];
+    uint32_t t0 = micros(), next = t0;
+    while (micros() - t0 < 50000) {            // 50ms 동안 8kHz로 측정, 최댓값-최솟값 = 진폭
+      while ((int32_t)(micros() - next) < 0) {}
+      next += SAMPLE_US;
       int v = analogRead(PIN_MIC);
       if (v < mn) mn = v;
       if (v > mx) mx = v;
+      if (ns < FFT_N) raw[ns] = v;
+      ns++;
     }
     float p2p = mx - mn;
+    float sp = 0, fl = 0, ct = 0;
+    bool specOk = ns >= FFT_N && specFeatures(raw, ns * 20.0f, sp, fl, ct);   // 실제 샘플링 주파수 = ns / 0.05초
     if (baseline < 0) baseline = p2p;
     bool over = (p2p > baseline * SPIKE_RATIO) && (p2p - baseline > SPIKE_MIN_ADC);
     overRun = over ? overRun + 1 : 0;
@@ -157,6 +223,7 @@ void soundTask(void*) {
       if (secFilled < SEC_RING) secFilled++;
       secSum = 0; secN = 0;
     }
+    if (specOk) { double w = (double)p2p * p2p; specW += w; specSp += w * sp; specFl += w * fl; specCt += w * ct; }
     if (newSpike) { sndSpikes++; spikeT[spikeHead] = millis(); spikeHead = (spikeHead + 1) % SPK_RING; }
     portEXIT_CRITICAL(&sndMux);
     vTaskDelay(1);
@@ -518,7 +585,12 @@ void makeRecord() {
   portENTER_CRITICAL(&sndMux);
   float s = sndSum, sq = sndSq, mx = sndMax; int n = sndN, spk = sndSpikes;
   sndSum = sndSq = sndMax = 0; sndN = sndSpikes = 0;
+  double sw = specW, ssp = specSp, sfl = specFl, sct = specCt;
+  specW = specSp = specFl = specCt = 0;
   portEXIT_CRITICAL(&sndMux);
+  r.sndSp   = sw > 0 ? ssp / sw : NAN;
+  r.sndFlat = sw > 0 ? sfl / sw : NAN;
+  r.sndCent = sw > 0 ? sct / sw : NAN;
   r.sndMean = n ? s / n : NAN;
   r.sndStd  = n ? sqrtf(fmaxf(sq / n - r.sndMean * r.sndMean, 0)) : NAN;
   r.sndMax  = mx;
@@ -560,6 +632,9 @@ void makeRecord() {
     ",\"snd_std\":" + jnum(r.sndStd, 1) +
     ",\"snd_max\":" + jnum(r.sndMax, 0) +
     ",\"snd_spikes\":" + String(r.sndSpikes) +
+    ",\"snd_sp\":" + jnum(r.sndSp, 3) +
+    ",\"snd_flat\":" + jnum(r.sndFlat, 3) +
+    ",\"snd_cent\":" + jnum(r.sndCent, 0) +
     ",\"reed\":\"" + reed + "\"" +
     ",\"state\":" + String((int)state) +
     ",\"vent\":" + (ventAlert ? "true" : "false") +
