@@ -1,112 +1,141 @@
 # %% [markdown]
-# # 05. 학습한 인공신경망을 ESP32에 넣기 — 환경 부담 점수로 신호등 켜기
-# 03번에서 학습한 상태 분류 MLP(입력 8 → 16 → 8 → 출력 3)의 가중치를 C 헤더 파일(`model_weights.h`)로 바꾼다.
+# # 05. 장치에 인공신경망 넣기 — 환경 부담 점수로 신호등 켜기
 #
-# 장치는 신경망 출력을 '상태 이름'으로 바로 쓰지 않고, **환경 부담 점수 = 1 − P(최적)** 으로 바꿔 쓴다. 이 점수를 약 3분 동안 부드럽게(지수이동평균) 만든 뒤
-# - 점수 < 0.4 → **초록(양호)**, 0.4 이상 → **노랑(주의)**, 0.7 이상 → **빨강(경고)**
+# ## 왜 상태 분류 신경망을 그대로 넣지 않았나
+# 03번의 상태 분류 MLP는 11/14 오후 2시간(라벨 9개) 동안의 조건(온도 23.05~23.58℃, 조도 약 200lx)만 보고 배웠다. 그 범위를 조금만 벗어나도(밤 기온 22℃, 불 끈 방 등) 출력이 0이나 1로 쏠려 신호등이 계속 한 색으로 켜졌다(아래 1번에서 확인). 그래서 장치에는
 #
-# 이렇게 하면 소음·조도·CO₂를 따로 나눠 판단하지 않고 **모든 센서를 한꺼번에 본 신경망 계산 하나**로 단계를 정할 수 있고, 라벨에 '졸림'이 없어도 세 단계를 표현할 수 있다. 원인(CO₂·조도·소음 등)은 화면 설명용으로 따로 보여 준다.
+# 1. **7일치 기록(5,551개 시점)으로 학습하고 처음 보는 날로 검증한 CO₂ 10분 예측 신경망(02번)**을 넣고,
+# 2. 그 예측값과 다른 센서 값을 **0~1 부담 점수로 바꿔 합치는 공식**으로 환경 부담 점수를 만든다.
 #
-# **검증:** 장치의 C 코드와 똑같은 계산(z-점수 → 행렬곱 → ReLU → 행렬곱 → ReLU → 행렬곱 → 가장 큰 값)을 32비트 실수로 다시 해서, 파이썬 모델의 예측과 **모든 기록에서 같은지** 확인한다.
+# | 항목 | 0점 → 1점 | 근거 |
+# |---|---|---|
+# | CO₂ (**10분 뒤 예측값**) | 1000 → 2500 ppm | 학교보건법 1000ppm, 04번 최적 확률 경계 약 2100ppm |
+# | 소음 | 10분 급증 5 → 40회, 평균 크기 250 → 600 중 큰 값 | 조용할 때 크기 약 210, 지속 소음 기준 500 |
+# | 조명 (최근 10초) | 기준(luxLow) 이상 0, 미만이면 0.5부터 어두울수록 1 | 학교보건법 300lx(웹앱에서 조정) |
+# | 온도·습도 | 18~28℃, 30~80% 안이면 0, 벗어나면 0.5부터 | 학교보건법 |
+#
+# **합치는 방법:** 점수 = 1 − (1−s_CO₂)(1−s_소음)(1−s_조명)(1−s_온습도). 한 요인만 커도 점수가 오르고, 여러 요인이 조금씩 나쁘면 함께 쌓여 오른다('여러 요인 복합').
+#
+# **단계:** 점수(약 3분 지수이동평균) < 0.4 초록(양호), ≥ 0.4 노랑(주의), ≥ 0.7 빨강(경고). CO₂만 보면 10분 뒤 예측 1600ppm에서 노랑, 2050ppm에서 빨강이다.
 
 # %%
-import os, sys, numpy as np, pandas as pd, joblib
+import os, numpy as np, pandas as pd, joblib, matplotlib.pyplot as plt, matplotlib.dates as md
+from sklearn.metrics import roc_auc_score
 from common import *
-sys.path.insert(0, os.path.join(ROOT, "tools"))
-from export_mlp import FEATURES
 
-pack = joblib.load(f"{PROC}/state_mlp8.joblib"); m, sc = pack["model"], pack["scaler"]
-assert [f[2:] for f in pack["feats"]] == FEATURES, "특징 순서가 펌웨어와 다름"
-W = [np.asarray(w, np.float64) for w in m.coefs_]; B = [np.asarray(b, np.float64) for b in m.intercepts_]
-
-# 펌웨어 출력은 항상 3칸(0=최적, 1=졸림, 2=산만). 학습에 없던 상태는 절대 고르지 않도록 편향을 아주 작게 둔다.
-cls = list(m.classes_)
-if len(cls) == 2 and W[2].shape[1] == 1:          # 이진 분류: 출력 1개(로짓) → 두 칸으로 펼침
-    W[2] = np.hstack([-W[2] / 2, W[2] / 2]); B[2] = np.array([-B[2][0] / 2, B[2][0] / 2])
-W3 = np.zeros((W[2].shape[0], 3)); B3 = np.full(3, -1e4)
-for j, c in enumerate(cls): W3[:, c] = W[2][:, j]; B3[c] = B[2][j]
-W[2], B[2] = W3, B3
-print("학습된 상태:", [STATE_KO[c] for c in cls], "| 층 크기:", [w.shape for w in W])
+# %% [markdown]
+# ## 1) 상태 분류 신경망이 학습 범위 밖에서 쏠리는지 확인
 
 # %%
-def cf(x):                                        # C 실수 표기 (정수 모양이면 .0 을 붙여야 f 접미사가 유효)
+rec = pd.read_csv(f"{PROC}/records_clean.csv", encoding="utf-8-sig")
+rec["t"] = pd.to_datetime(rec["time"]).dt.tz_convert("Asia/Seoul").dt.tz_localize(None)   # 한국 시간
+st = joblib.load(f"{PROC}/state_mlp8.joblib")
+X8 = rec[st["feats"]].fillna(rec[st["feats"]].mean())
+rec["cls_score"] = 1 - st["model"].predict_proba(st["scaler"].transform(X8))[:, 0]
+lab_mask = rec["state_label"].notna()
+print(f"라벨 구간 밖(학습하지 않은 시간)에서 상태 분류 신경망 점수가 0.7 이상(빨강)인 비율: {(rec.loc[~lab_mask,'cls_score']>=.7).mean()*100:.0f}%")
+
+# %% [markdown]
+# ## 2) 장치와 같은 계산으로 CO₂ 10분 뒤 예측값 만들기
+# 장치는 10초 기록 6개를 평균해 1분 값을 만들고, 직전 3분 중앙값으로 다듬은 뒤 1·2·5·10분 변화량을 02번 신경망에 넣는다(창문 센서가 없으면 창문 값은 0).
+
+# %%
+co2m = joblib.load(f"{PROC}/co2_mlp.joblib")
+def co2_pred_series(df):
+    out = pd.Series(np.nan, index=df.index)
+    for _, g in df.groupby("seg"):
+        m1 = g.set_index("t")["co2"].resample("1min").mean()
+        c = m1.rolling(3, min_periods=2).median()
+        F = pd.DataFrame({f"d{k}": c - c.shift(k) for k in (1, 2, 5, 10)}); F["win"] = 0.0; F["dwin"] = 0.0
+        ok = F.notna().all(axis=1)
+        pred = pd.Series(np.nan, index=F.index)
+        pred[ok] = c[ok] + co2m["model"].predict(co2m["scaler"].transform(F.loc[ok, co2m["feats"]]))
+        out.loc[g.index] = pred.reindex(g["t"].dt.floor("1min")).to_numpy()
+    return out
+rec["co2_pred10"] = co2_pred_series(rec).fillna(rec["co2"])
+
+# %% [markdown]
+# ## 3) 환경 부담 점수 계산 (펌웨어와 같은 식)
+
+# %%
+def ramp(x, a, b): return np.clip((x - a) / (b - a), 0, 1)
+LUX_LOW, TMIN, TMAX, HMIN, HMAX = 100, 18, 28, 30, 80
+def env_score(df):
+    s_co2 = ramp(df["co2_pred10"], 1000, 2500)
+    s_snd = np.maximum(ramp(df["f_snd_spikes"], 5, 40), ramp(df["f_snd_mean"], 250, 600))
+    lux = df["lux"]                                   # 장치와 같이 최근 10초 조도 사용
+    s_lux = np.where(lux >= LUX_LOW, 0, 0.5 + 0.5 * np.clip((LUX_LOW - lux) / LUX_LOW, 0, 1))
+    t, h = df["f_temp"], df["f_hum"]
+    s_t = np.where((t >= TMIN) & (t <= TMAX), 0, 0.5 + 0.5 * np.clip(np.maximum(TMIN - t, t - TMAX) / 3, 0, 1))
+    s_h = np.where((h >= HMIN) & (h <= HMAX), 0, 0.5 + 0.5 * np.clip(np.maximum(HMIN - h, h - HMAX) / 15, 0, 1))
+    parts = pd.DataFrame({"CO₂(예측)": s_co2, "소음": s_snd, "조명": s_lux, "온습도": np.maximum(s_t, s_h)}, index=df.index).fillna(0)
+    return 1 - (1 - parts).prod(axis=1), parts
+rec["score_raw"], parts = env_score(rec)
+rec["score"] = rec.groupby("seg")["score_raw"].transform(lambda s: s.ewm(alpha=0.05, adjust=False).mean())
+rec["level"] = np.select([rec.score >= .7, rec.score >= .4], [2, 1], 0)
+rec["cause"] = parts.idxmax(axis=1).where(rec.level > 0, "")
+
+# %% [markdown]
+# ## 4) 결과: 하루 동안 신호등이 어떻게 켜졌을까
+
+# %%
+fig, ax = plt.subplots(2, 1, figsize=(13, 6.5), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
+ax[0].plot(rec.t, rec.score_raw, color="#bbb", lw=.6, label="이번 계산값(10초)")
+ax[0].plot(rec.t, rec.score, color="#1f2933", lw=1.6, label="지수이동평균 (장치 표시값)")
+ax[0].plot(rec.t, rec.cls_score, color="#7b61ff", lw=.8, alpha=.6, label="(비교) 상태 분류 신경망 점수")
+ax[0].axhspan(0, .4, color="#2e9e5b", alpha=.10); ax[0].axhspan(.4, .7, color="#e0a800", alpha=.12); ax[0].axhspan(.7, 1.02, color="#d64545", alpha=.10)
+ax[0].set_ylabel("환경 부담 점수"); ax[0].legend(fontsize=8, loc="upper right"); ax[0].grid(alpha=.25); ax[0].set_ylim(-.02, 1.02)
+ax[1].plot(rec.t, rec.co2, color="#2b6cd8", lw=1, label="현재 CO₂"); ax[1].plot(rec.t, rec.co2_pred10, color="#d64545", lw=.8, alpha=.8, label="10분 뒤 예측 (신경망)")
+ax[1].set_ylabel("CO₂ (ppm)"); ax[1].legend(fontsize=8); ax[1].grid(alpha=.25)
+ax[1].xaxis.set_major_formatter(md.DateFormatter("%m/%d %H:%M"))
+ax[0].set_title("환경 부담 점수와 신호등 단계 (11/14~15 전체 기록)")
+plt.tight_layout(); plt.savefig(f"{RES}/05_env_score_timeline.png", dpi=150); plt.show()
+
+share = rec.groupby(rec.t.dt.strftime("%m/%d %H시"))["level"].agg(lambda s: f"초록 {(s==0).mean()*100:.0f}% 노랑 {(s==1).mean()*100:.0f}% 빨강 {(s==2).mean()*100:.0f}%")
+print(share.iloc[::2].to_string())
+print("\n노랑·빨강일 때 가장 큰 원인:", rec.loc[rec.level > 0, "cause"].value_counts().to_dict())
+
+# %% [markdown]
+# ## 5) 사람이 남긴 라벨과 비교
+
+# %%
+L = rec[lab_mask]
+y = L["state_label"].astype(int)
+print(f"라벨 구간 AUC — 환경 부담 점수 {roc_auc_score(y == 2, L.score):.3f}")
+print(pd.crosstab(y.map(STATE_KO), L.level.map({0: "초록", 1: "노랑", 2: "빨강"}), normalize="index").round(2).to_string())
+
+# %% [markdown]
+# ## 6) CO₂ 예측 신경망을 C 헤더로 내보내기 + 검증
+
+# %%
+m, sc = co2m["model"], co2m["scaler"]
+W = [np.asarray(w) for w in m.coefs_]; B = [np.asarray(b) for b in m.intercepts_]
+def cf(x):
     s = f"{x:.7g}"
     return (s if any(ch in s for ch in ".en") else s + ".0") + "f"
 def arr1(n, v): return f"const float {n}[{len(v)}] = {{{', '.join(cf(x) for x in v)}}};\n"
 def arr2(n, M):
     rows = ",\n  ".join("{" + ", ".join(cf(x) for x in r) + "}" for r in M)
     return f"const float {n}[{M.shape[0]}][{M.shape[1]}] = {{\n  {rows}\n}};\n"
-std = np.where(sc.scale_ == 0, 1.0, sc.scale_)
-path = os.path.join(ROOT, "firmware/classroom_env/model_weights.h")
+path = os.path.join(ROOT, "firmware/classroom_env/co2_weights.h")
 with open(path, "w", encoding="utf-8") as f:
-    f.write("// 자동 생성 파일 — analysis/05_export_to_esp32.py\n// 입력 순서: " + ", ".join(FEATURES) + "\n#pragma once\n")
-    f.write(f"#define MLP_IN {W[0].shape[0]}\n#define MLP_H1 {W[0].shape[1]}\n#define MLP_H2 {W[1].shape[1]}\n#define MLP_OUT 3\n")
-    f.write(arr1("MLP_MEAN", sc.mean_) + arr1("MLP_STD", std))
-    for k in range(3): f.write(arr2(f"MLP_W{k+1}", W[k].T) + arr1(f"MLP_B{k+1}", B[k]))
+    f.write("// 자동 생성 파일 — analysis/05_export_to_esp32.py\n// CO2 10분 뒤 변화량 예측 MLP. 입력 순서: " + ", ".join(co2m["feats"]) + "\n#pragma once\n")
+    f.write(f"#define CO2N_IN {W[0].shape[0]}\n#define CO2N_H1 {W[0].shape[1]}\n#define CO2N_H2 {W[1].shape[1]}\n")
+    f.write(arr1("CO2N_MEAN", sc.mean_) + arr1("CO2N_STD", np.where(sc.scale_ == 0, 1, sc.scale_)))
+    f.write(arr2("CO2N_W1", W[0].T) + arr1("CO2N_B1", B[0]) + arr2("CO2N_W2", W[1].T) + arr1("CO2N_B2", B[1]))
+    f.write(arr1("CO2N_W3", W[2][:, 0]) + f"const float CO2N_B3 = {cf(B[2][0])};\n")
 print("저장:", path, f"({os.path.getsize(path)/1024:.1f} KB)")
 
-# %% [markdown]
-# ## 검증: 장치 계산 = 파이썬 모델?
-
-# %%
-lab = pd.read_csv(f"{PROC}/labeled.csv", encoding="utf-8-sig").dropna(subset=pack["feats"])
-X = lab[pack["feats"]].to_numpy()
+# 장치와 같은 32비트 실수 계산 = 파이썬 예측? (실제 기록에서 나온 입력으로 확인)
 f32 = np.float32
-z = ((X - sc.mean_) / std).astype(f32)
-h = np.maximum(0, z @ W[0].astype(f32) + B[0].astype(f32))
-h = np.maximum(0, h @ W[1].astype(f32) + B[1].astype(f32))
-dev = np.argmax(h @ W[2].astype(f32) + B[2].astype(f32), axis=1)
-py = m.predict(sc.transform(lab[pack["feats"]]))
-print(f"비교한 기록 {len(X):,}개 중 예측이 같은 기록: {(dev == py).sum():,}개 ({(dev == py).mean()*100:.2f}%)")
-
-# %% [markdown]
-# ## 환경 부담 점수와 단계 기준 정하기
-# 학습에 쓰지 않은 라벨 구간에 대한 점수(라벨 하나씩 빼서 학습한 모델의 점수)를 시간 순서로 이어 붙이고, 장치와 같은 지수이동평균(10초마다 5%)을 적용했다. 부드럽게 하기 전후의 구분력(AUC)과, 실제 상태별로 신호등이 어떤 색이 되는지 확인한다.
-
-# %%
-from sklearn.neural_network import MLPClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
-from sklearn.model_selection import LeaveOneGroupOut
-from sklearn.metrics import roc_auc_score
-import matplotlib.pyplot as plt
-L = lab.sort_values("ts").reset_index(drop=True)
-yy = L["state_label"].to_numpy(); gg = L["group"].to_numpy(); F = pack["feats"]
-raw = np.zeros(len(L))
-for tr, te in LeaveOneGroupOut().split(L, yy, gg):
-    mm = make_pipeline(StandardScaler(), MLPClassifier((16, 8), activation="relu", alpha=1e-2, max_iter=2000, random_state=0)).fit(L[F].iloc[tr], yy[tr])
-    raw[te] = 1 - mm.predict_proba(L[F].iloc[te])[:, list(mm.classes_).index(0)]
-ema = pd.Series(raw).ewm(alpha=0.05, adjust=False).mean().to_numpy()
-print(f"구분력 AUC — 부드럽게 하기 전 {roc_auc_score(yy == 2, raw):.3f} → 지수이동평균 후 {roc_auc_score(yy == 2, ema):.3f}")
-WARN, ALERT = 0.4, 0.7
-lv = np.where(ema >= ALERT, 2, np.where(ema >= WARN, 1, 0))
-tab = pd.DataFrame({s_: [(lv[yy == s_] == k).mean() for k in range(3)] for s_ in sorted(np.unique(yy))}, index=["초록(양호)", "노랑(주의)", "빨강(경고)"])
-tab.columns = [f"실제 {STATE_KO[c]}" for c in tab.columns]
-print((tab * 100).round(0).astype(int).astype(str).add("%").to_string())
-
-fig, ax = plt.subplots(1, 2, figsize=(13, 4), gridspec_kw={"width_ratios": [2.3, 1]})
-t = pd.to_datetime(L["ts"], unit="s", utc=True).dt.tz_convert("Asia/Seoul")
-ax[0].scatter(t, raw, s=4, color="#bbb", label="신경망 점수(10초)")
-ax[0].plot(t, ema, color="#1f2933", lw=1.8, label="지수이동평균 (장치 표시값)")
-ax[0].axhspan(0, WARN, color="#2e9e5b", alpha=.10); ax[0].axhspan(WARN, ALERT, color="#e0a800", alpha=.12); ax[0].axhspan(ALERT, 1.02, color="#d64545", alpha=.10)
-for gi, gdf in L.groupby("group"):
-    ax[0].axvspan(pd.to_datetime(gdf.ts.min(), unit="s", utc=True).tz_convert("Asia/Seoul"), pd.to_datetime(gdf.ts.max(), unit="s", utc=True).tz_convert("Asia/Seoul"),
-                  ymin=0, ymax=.04, color=STATE_COLOR[int(gdf.state_label.iloc[0])])
-import matplotlib.dates as md
-ax[0].xaxis.set_major_formatter(md.DateFormatter("%H:%M", tz="Asia/Seoul")); ax[0].set_ylim(-.02, 1.02)
-ax[0].set_ylabel("환경 부담 점수"); ax[0].set_title("시간에 따른 점수 (아래 색 띠 = 실제 상태: 초록 최적, 빨강 산만)"); ax[0].legend(loc="upper right", fontsize=8); ax[0].grid(alpha=.25)
-bottom = np.zeros(tab.shape[1])
-for k, col in enumerate(["#2e9e5b", "#e0a800", "#d64545"]):
-    ax[1].bar(tab.columns, tab.iloc[k] * 100, bottom=bottom, color=col, label=tab.index[k]); bottom += tab.iloc[k].to_numpy() * 100
-ax[1].set_ylabel("%"); ax[1].set_title("실제 상태별 신호등 색 비율"); ax[1].legend(fontsize=8)
-plt.tight_layout(); plt.savefig(f"{RES}/05_score_levels.png", dpi=150); plt.show()
-
-# %% [markdown]
-# ## 장치의 점수 계산 검증
-# 장치 코드와 같은 32비트 실수로 소프트맥스까지 계산한 점수가 파이썬 모델의 점수와 같은지 확인한다.
-
-# %%
-o = h @ W[2].astype(f32) + B[2].astype(f32)
-o = np.exp(o - o.max(axis=1, keepdims=True)); dev_score = 1 - o[:, 0] / o.sum(axis=1)
-py_score = 1 - m.predict_proba(sc.transform(lab[pack["feats"]]))[:, list(m.classes_).index(0)]
-print(f"점수 최대 차이: {np.abs(dev_score - py_score).max():.2e} (32비트 실수 반올림 수준이면 같은 계산)")
+inp = []
+for _, g in rec.groupby("seg"):
+    c = g.set_index("t")["co2"].resample("1min").mean().rolling(3, min_periods=2).median()
+    F = pd.DataFrame({f"d{k}": c - c.shift(k) for k in (1, 2, 5, 10)}); F["win"] = 0.0; F["dwin"] = 0.0
+    inp.append(F.dropna())
+Xs = pd.concat(inp)[co2m["feats"]].to_numpy()
+z = ((Xs - sc.mean_) / np.where(sc.scale_ == 0, 1, sc.scale_)).astype(f32)
+hh = np.maximum(0, z @ W[0].astype(f32) + B[0].astype(f32)); hh = np.maximum(0, hh @ W[1].astype(f32) + B[1].astype(f32))
+dev = hh @ W[2][:, 0].astype(f32) + f32(B[2][0])
+print(f"{len(Xs):,}개 입력에서 장치식 계산과 파이썬 예측의 최대 차이: {np.abs(dev - m.predict(sc.transform(Xs))).max():.2e} ppm")
+rec[["time", "co2", "co2_pred10", "score_raw", "score", "level", "cause"]].to_csv(f"{PROC}/env_score.csv", index=False, encoding="utf-8-sig")

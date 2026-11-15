@@ -106,8 +106,8 @@ plot_tree(dt, feature_names=[c[2:] for c in F11], class_names=[STATE_KO[c] for c
 plt.tight_layout(); plt.savefig(f"{RES}/03_tree.png", dpi=150); plt.show()
 
 # %% [markdown]
-# ## 장치용 모델 학습 · 저장
-# ESP32 펌웨어의 인공신경망 입력은 기본 8개 특징이다. 전체 라벨로 다시 학습해 저장하고, 05번에서 C 헤더로 바꾼다.
+# ## 전체 라벨로 다시 학습해 저장
+# 05번에서 이 모델이 학습 범위(11/14 오후 2시간) 밖에서도 쓸 수 있는지 확인한다.
 
 # %%
 import joblib

@@ -5,12 +5,12 @@
  * 하는 일
  *  1) 소리(MAX4466)는 50ms 창 단위로 계속 측정(8kHz 샘플링 + FFT로 주파수 특징 계산), CO2(UART·PWM 두 방식)·온습도·조도는 1초마다 측정
  *  2) 10초마다 평균을 내서 하나의 기록으로 만들고 Firebase 에 업로드
- *  3) 최근 10분 기록으로 특징 8개를 계산해 '환경 부담 점수'(0~1)를 구하고 단계로 표시
- *     - USE_MLP 1 : 점수 = 1 − 인공신경망이 계산한 '최적' 확률 (model_weights.h)
- *     - USE_MLP 0 : 점수 = 규칙 판단을 숫자로 바꾼 값 (데이터 수집 기간용)
- *     - 점수를 약 3분 동안 부드럽게(지수이동평균) 한 뒤
- *       점수 < scoreWarn → 초록(양호), scoreWarn 이상 → 노랑(주의), scoreAlert 이상 → 빨강(경고)
- *     - 원인(CO₂·조도·온습도·소음)은 LCD·웹앱 설명용으로 따로 표시
+ *  3) 환경 부담 점수(0~1)를 계산해 신호등 3단계로 표시
+ *     - CO₂ 10분 뒤 예측: USE_MLP 1 이면 인공신경망(co2_weights.h, 7일치로 학습), 0 이면 직선 연장
+ *     - 항목별 부담(0~1): CO₂(예측값 1000→2500ppm), 소음(급증·크기), 조명(기준 미만), 온습도(기준 밖)
+ *     - 점수 = 1 − Π(1 − 항목 부담)  → 약 3분 지수이동평균
+ *     - 점수 < scoreWarn → 초록(양호), scoreWarn 이상 → 노랑(주의), scoreAlert 이상 → 빨강(경고)
+ *     - 가장 큰 항목을 원인으로 LCD·웹앱에 표시, 아주 시끄러우면 0.3초 안에 즉시 빨강
  *  4) 신호등 LED · LCD · 서보모터(창문 모형) 제어, 웹앱의 원격 설정(/control) 반영
  */
 #include <Arduino.h>
@@ -46,7 +46,7 @@ Adafruit_SHT31 sht;
 #endif
 
 #if USE_MLP
-#include "model_weights.h"
+#include "co2_weights.h"     // CO2 10분 예측 인공신경망 가중치 (analysis/05_export_to_esp32)
 #endif
 
 // ───────── 핀 배치 ─────────
@@ -390,88 +390,89 @@ float etaMin = -1;   // 졸음 임계값까지 예상 시간(분), -1 = 해당 �
 float scoreRaw = NAN, scoreEma = NAN;   // 환경 부담 점수(이번 계산값, 부드럽게 한 값)
 const float SCORE_EMA = 0.05f;          // 10초마다 5%씩 따라감 → 약 3분 평균 효과
 
-#if USE_MLP
-int mlpPredict(const Features& f) {
-  float x[MLP_IN] = {f.sndMean, f.sndStd, f.sndSpikes, f.co2Mean, f.co2Slope, f.lux, f.temp, f.hum};
-  for (int i = 0; i < MLP_IN; i++) {
-    if (isnan(x[i])) x[i] = MLP_MEAN[i];
-    x[i] = (x[i] - MLP_MEAN[i]) / MLP_STD[i];      // z-점수 표준화
-  }
-  float h1[MLP_H1], h2[MLP_H2], o[MLP_OUT];
-  for (int j = 0; j < MLP_H1; j++) {
-    float s = MLP_B1[j];
-    for (int i = 0; i < MLP_IN; i++) s += MLP_W1[j][i] * x[i];
-    h1[j] = s > 0 ? s : 0;                          // ReLU
-  }
-  for (int j = 0; j < MLP_H2; j++) {
-    float s = MLP_B2[j];
-    for (int i = 0; i < MLP_H1; i++) s += MLP_W2[j][i] * h1[i];
-    h2[j] = s > 0 ? s : 0;
-  }
-  int best = 0;
-  for (int j = 0; j < MLP_OUT; j++) {
-    float s = MLP_B3[j];
-    for (int i = 0; i < MLP_H2; i++) s += MLP_W3[j][i] * h2[i];
-    o[j] = s;
-    if (o[j] > o[best]) best = j;
-  }
-  return best;
-}
+// ───────── CO₂ 10분 뒤 예측 ─────────
+// 10초 기록 6개 → 1분 평균, 최근 16분 보관. 직전 3분 중앙값으로 다듬은 값의 1·2·5·10분 변화량을 신경망에 넣는다
+const int CO2M_N = 16;
+float co2Min[CO2M_N]; int co2MinHead = 0, co2MinCount = 0;
+float co2MinAcc = 0; int co2MinCnt = 0, co2MinRecs = 0;
+float co2Pred10 = NAN;   // 10분 뒤 예측 CO2 (ppm)
 
-// 환경 부담 점수 = 1 − P(최적). 출력값에 소프트맥스를 적용해 확률로 바꿈
-float mlpScore(const Features& f) {
-  float x[MLP_IN] = {f.sndMean, f.sndStd, f.sndSpikes, f.co2Mean, f.co2Slope, f.lux, f.temp, f.hum};
-  for (int i = 0; i < MLP_IN; i++) {
-    if (isnan(x[i])) x[i] = MLP_MEAN[i];
-    x[i] = (x[i] - MLP_MEAN[i]) / MLP_STD[i];
-  }
-  float h1[MLP_H1], h2[MLP_H2], o[MLP_OUT];
-  for (int j = 0; j < MLP_H1; j++) { float s = MLP_B1[j]; for (int i = 0; i < MLP_IN; i++) s += MLP_W1[j][i] * x[i]; h1[j] = s > 0 ? s : 0; }
-  for (int j = 0; j < MLP_H2; j++) { float s = MLP_B2[j]; for (int i = 0; i < MLP_H1; i++) s += MLP_W2[j][i] * h1[i]; h2[j] = s > 0 ? s : 0; }
-  float mx = -1e30f;
-  for (int j = 0; j < MLP_OUT; j++) { float s = MLP_B3[j]; for (int i = 0; i < MLP_H2; i++) s += MLP_W3[j][i] * h2[i]; o[j] = s; if (s > mx) mx = s; }
-  float sum = 0;
-  for (int j = 0; j < MLP_OUT; j++) { o[j] = expf(o[j] - mx); sum += o[j]; }
-  return 1.0f - o[0] / sum;
+void pushCo2Record(float co2) {          // makeRecord()에서 10초마다 호출
+  if (!isnan(co2)) { co2MinAcc += co2; co2MinCnt++; }
+  if (++co2MinRecs < 6) return;
+  co2Min[co2MinHead] = co2MinCnt ? co2MinAcc / co2MinCnt : NAN;
+  co2MinHead = (co2MinHead + 1) % CO2M_N; if (co2MinCount < CO2M_N) co2MinCount++;
+  co2MinAcc = 0; co2MinCnt = 0; co2MinRecs = 0;
+}
+float co2MinAgo(int k) { return k < co2MinCount ? co2Min[(co2MinHead - 1 - k + CO2M_N) % CO2M_N] : NAN; }
+float co2Smooth(int k) {                 // k분 전 기준 '직전 3분 중앙값'
+  float v[3]; int n = 0;
+  for (int j = 0; j < 3; j++) { float x = co2MinAgo(k + j); if (!isnan(x)) v[n++] = x; }
+  if (n < 2) return NAN;
+  if (n == 2) return (v[0] + v[1]) / 2;
+  float a = v[0], b = v[1], c = v[2];
+  return fmaxf(fminf(a, b), fminf(fmaxf(a, b), c));
+}
+#if USE_MLP
+float co2NetDelta(const float* x) {      // 입력 6개 → 10분 뒤 변화량(ppm)
+  float z[CO2N_IN], h1[CO2N_H1], h2[CO2N_H2];
+  for (int i = 0; i < CO2N_IN; i++) z[i] = (x[i] - CO2N_MEAN[i]) / CO2N_STD[i];
+  for (int j = 0; j < CO2N_H1; j++) { float s = CO2N_B1[j]; for (int i = 0; i < CO2N_IN; i++) s += CO2N_W1[j][i] * z[i]; h1[j] = s > 0 ? s : 0; }
+  for (int j = 0; j < CO2N_H2; j++) { float s = CO2N_B2[j]; for (int i = 0; i < CO2N_H1; i++) s += CO2N_W2[j][i] * h1[i]; h2[j] = s > 0 ? s : 0; }
+  float o = CO2N_B3; for (int i = 0; i < CO2N_H2; i++) o += CO2N_W3[i] * h2[i];
+  return o;
 }
 #endif
+float predictCo2In10(float co2Now, float slope5) {
+#if USE_MLP
+  float c0 = co2Smooth(0), c1 = co2Smooth(1), c2 = co2Smooth(2), c5 = co2Smooth(5), c10 = co2Smooth(10);
+  if (!isnan(c0) && !isnan(c1) && !isnan(c2) && !isnan(c5) && !isnan(c10)) {
+    float x[6] = {c0 - c1, c0 - c2, c0 - c5, c0 - c10, 0, 0};   // 창문 센서 없음 → 0
+    return c0 + co2NetDelta(x);
+  }
+#endif
+  return isnan(co2Now) ? NAN : co2Now + slope5 * 10;          // 기록이 모자라면 직선 연장
+}
+
+float rampf(float x, float a, float b) { if (isnan(x)) return 0; float t = (x - a) / (b - a); return t < 0 ? 0 : (t > 1 ? 1 : t); }
 
 void decide(const Features& f, float co2Now) {
-  // 1) 환기 알림: 예측 + 히스테리시스
-  float slope5 = co2SlopeLast(30);                   // 최근 5분 기울기
+  // 1) CO2 10분 뒤 예측 + 환기 알림(히스테리시스)
+  float slope5 = co2SlopeLast(30);                   // 최근 5분 기울기 (ppm/분)
+  co2Pred10 = predictCo2In10(co2Now, slope5);
   etaMin = -1;
   if (!isnan(co2Now) && slope5 > 0.5 && co2Now < ctl.co2Drowsy)
     etaMin = (ctl.co2Drowsy - co2Now) / slope5;
   if (!isnan(co2Now)) {
-    if (!ventAlert && (co2Now >= ctl.co2Drowsy || (etaMin >= 0 && etaMin <= ctl.etaMin))) ventAlert = true;
+    bool soon = (etaMin >= 0 && etaMin <= ctl.etaMin) || (!isnan(co2Pred10) && co2Pred10 >= ctl.co2Drowsy);
+    if (!ventAlert && (co2Now >= ctl.co2Drowsy || soon)) ventAlert = true;   // 직선 연장 '또는' 신경망 예측
     else if (ventAlert && co2Now <= ctl.co2Clear) ventAlert = false;
   }
-  // 3) 원인 (규칙 기반, 우선순위 순)
-  bool luxLow  = !isnan(lcdLux) && lcdLux < ctl.luxLow;   // 최근 10초 조도 기준 (금방 돌아오게)
-  bool tHigh   = !isnan(f.temp) && f.temp > ctl.tMax;
-  bool tLow    = !isnan(f.temp) && f.temp < ctl.tMin;
-  bool hBad    = !isnan(f.hum)  && (f.hum < ctl.hMin || f.hum > ctl.hMax);
 
-  // 원인 설명(우선순위 순) — 신호등 색은 아래 점수로 정하고, 원인은 화면 설명에만 씀
-  float ruleScore = 0;            // 인공신경망을 쓰지 않을 때의 점수
-  if (ventAlert)        { ruleScore = 0.55f; baseCauseKo = "CO2 상승 - 환기";   baseCauseLcd = "CO2 - VENTILATE"; }
-  else if (luxLow)      { ruleScore = 0.55f; baseCauseKo = "조명 부족";         baseCauseLcd = "LIGHT LOW"; }
-  else if (tHigh)       { ruleScore = 0.55f; baseCauseKo = "온도 높음";         baseCauseLcd = "TEMP HIGH"; }
-  else if (tLow)        { ruleScore = 0.55f; baseCauseKo = "온도 낮음";         baseCauseLcd = "TEMP LOW"; }
-  else if (hBad)        { ruleScore = 0.55f; baseCauseKo = "습도 부적절";       baseCauseLcd = "HUMIDITY"; }
-  else                  { baseCauseKo = "";                                     baseCauseLcd = "OK"; }
+  // 2) 항목별 부담(0~1)
+  float sCo2 = rampf(isnan(co2Pred10) ? co2Now : co2Pred10, 1000, 2500);
+  float sSnd = fmaxf(rampf(f.sndSpikes, 5, 40), rampf(f.sndMean, 250, 600));
+  float lux = lcdLux;                                 // 최근 10초 조도 (불을 켜면 바로 반영)
+  float sLux = (isnan(lux) || lux >= ctl.luxLow) ? 0 : 0.5f + 0.5f * fminf(1, (ctl.luxLow - lux) / ctl.luxLow);
+  float sT = 0, sH = 0;
+  if (!isnan(f.temp) && (f.temp < ctl.tMin || f.temp > ctl.tMax)) sT = 0.5f + 0.5f * fminf(1, fmaxf(ctl.tMin - f.temp, f.temp - ctl.tMax) / 3);
+  if (!isnan(f.hum)  && (f.hum < ctl.hMin  || f.hum > ctl.hMax))  sH = 0.5f + 0.5f * fminf(1, fmaxf(ctl.hMin - f.hum, f.hum - ctl.hMax) / 15);
 
-  // 환경 부담 점수 → 지수이동평균 → 단계
-#if USE_MLP
-  scoreRaw = mlpScore(f);
-#else
-  scoreRaw = ruleScore;
-#endif
+  // 3) 환경 부담 점수 = 1 − Π(1 − 부담) → 지수이동평균 → 단계
+  scoreRaw = 1 - (1 - sCo2) * (1 - sSnd) * (1 - sLux) * (1 - fmaxf(sT, sH));
   scoreEma = isnan(scoreEma) ? scoreRaw : scoreEma + SCORE_EMA * (scoreRaw - scoreEma);
   baseState = scoreEma >= ctl.scoreAlert ? ST_ALERT : (scoreEma >= ctl.scoreWarn ? ST_CAUTION : ST_GOOD);
   if (ventAlert && baseState == ST_GOOD) baseState = ST_CAUTION;      // 환기 알림 중에는 최소 노랑
-  if (baseState != ST_GOOD && baseCauseKo == "") { baseCauseKo = "여러 요인 복합"; baseCauseLcd = "MIXED FACTORS"; }
-  if (baseState == ST_GOOD && !ventAlert) { baseCauseKo = ""; baseCauseLcd = "OK"; }
+
+  // 4) 원인 설명: 가장 큰 항목
+  float mx = fmaxf(fmaxf(sCo2, sSnd), fmaxf(sLux, fmaxf(sT, sH)));
+  if (baseState == ST_GOOD)       { baseCauseKo = "";                 baseCauseLcd = "OK"; }
+  else if (mx < 0.25f)            { baseCauseKo = "여러 요인 복합";   baseCauseLcd = "MIXED FACTORS"; }
+  else if (mx == sCo2)            { baseCauseKo = "CO2 상승 - 환기";  baseCauseLcd = "CO2 - VENTILATE"; }
+  else if (mx == sLux)            { baseCauseKo = "조명 부족";        baseCauseLcd = "LIGHT LOW"; }
+  else if (mx == sSnd)            { baseCauseKo = "소음 많음";        baseCauseLcd = "NOISE"; }
+  else if (mx == sT)              { baseCauseKo = f.temp > ctl.tMax ? "온도 높음" : "온도 낮음"; baseCauseLcd = f.temp > ctl.tMax ? "TEMP HIGH" : "TEMP LOW"; }
+  else                            { baseCauseKo = "습도 부적절";      baseCauseLcd = "HUMIDITY"; }
 
   // 4) 창문(서보): 자동이면 환기 알림을 따라감
   if (ctl.winMode == "on") winOpen = true;
@@ -643,6 +644,7 @@ void makeRecord() {
   buf[bufHead] = r;
   bufHead = (bufHead + 1) % BUF_N;
   if (bufCount < BUF_N) bufCount++;
+  pushCo2Record(r.co2);
 
   lcdLux = r.lux;
   Features f = computeFeatures();
@@ -671,6 +673,7 @@ void makeRecord() {
     ",\"reed\":\"" + reed + "\"" +
     ",\"state\":" + String((int)state) +
     ",\"score\":" + jnum(scoreEma, 3) +
+    ",\"co2_pred10\":" + jnum(co2Pred10, 0) +
     ",\"vent\":" + (ventAlert ? "true" : "false") +
     ",\"win\":" + (winOpen ? "true" : "false") + "}";
 
@@ -680,6 +683,7 @@ void makeRecord() {
     ",\"eta_min\":" + jnum(etaMin, 1) +
     ",\"score\":" + jnum(scoreEma, 3) +
     ",\"score_raw\":" + jnum(scoreRaw, 3) +
+    ",\"co2_pred10\":" + jnum(co2Pred10, 0) +
     ",\"model\":\"" + (USE_MLP ? "mlp" : "rule") + "\"" +
     ",\"feat\":{\"snd_mean\":" + jnum(f.sndMean) + ",\"snd_std\":" + jnum(f.sndStd) +
       ",\"snd_spikes\":" + jnum(f.sndSpikes, 0) + ",\"co2_mean\":" + jnum(f.co2Mean, 0) +
