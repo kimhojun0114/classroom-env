@@ -657,15 +657,16 @@ void makeRecord() {
   r.sndSp   = sw > 0 ? ssp / sw : NAN;
   r.sndFlat = sw > 0 ? sfl / sw : NAN;
   r.sndCent = sw > 0 ? sct / sw : NAN;
+  r.sndMean = n ? s / n : NAN;
+  r.sndStd  = n ? sqrtf(fmaxf(sq / n - r.sndMean * r.sndMean, 0)) : NAN;
+  r.sndMax  = mx;
+  r.sndSpikes = spk;
+  // 소리 AI는 소리 값이 모두 채워진 뒤에 계산
 #if USE_MLP
   r.sndAi = soundAiBurden(r);
 #else
   r.sndAi = NAN;
 #endif
-  r.sndMean = n ? s / n : NAN;
-  r.sndStd  = n ? sqrtf(fmaxf(sq / n - r.sndMean * r.sndMean, 0)) : NAN;
-  r.sndMax  = mx;
-  r.sndSpikes = spk;
 
   r.co2  = co2Cnt ? co2Acc / co2Cnt : NAN;
   r.co2pwm = co2pCnt ? co2pAcc / co2pCnt : NAN;
