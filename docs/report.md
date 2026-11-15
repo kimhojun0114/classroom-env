@@ -3,6 +3,8 @@
 **2학년 7반 20713 김호준** · 인공지능 융합 프로젝트 · SDGs 4(양질의 교육) · 3(건강과 웰빙)
 깃허브: https://github.com/kimhojun0114/classroom-env · 웹앱: https://kimhojun0114.github.io/classroom-env/app/
 
+전처리·분석 노트북(코랩에서 바로 열기): [01 전처리](https://colab.research.google.com/github/kimhojun0114/classroom-env/blob/main/analysis/01_preprocess.ipynb) · [02 CO₂ 예측](https://colab.research.google.com/github/kimhojun0114/classroom-env/blob/main/analysis/02_co2_forecast.ipynb) · [03 상태 분류](https://colab.research.google.com/github/kimhojun0114/classroom-env/blob/main/analysis/03_state_classifier.ipynb) · [04 최적 조건·군집](https://colab.research.google.com/github/kimhojun0114/classroom-env/blob/main/analysis/04_optimal_conditions.ipynb) · [05 소리 AI](https://colab.research.google.com/github/kimhojun0114/classroom-env/blob/main/analysis/05_sound_autoencoder.ipynb) · [06 장치 탑재](https://colab.research.google.com/github/kimhojun0114/classroom-env/blob/main/analysis/06_export_to_esp32.ipynb)
+
 ---
 
 ## 1. 문제 인식
