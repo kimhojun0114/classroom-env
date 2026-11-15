@@ -19,13 +19,18 @@ FEATURES = ["snd_mean", "snd_std", "snd_spikes", "co2_mean",
             "co2_slope", "lux", "temp", "hum"]
 
 
+def _cf(x):
+    s = f"{x:.7g}"
+    return (s if any(ch in s for ch in ".en") else s + ".0") + "f"
+
+
 def _arr1(name, v):
-    vals = ", ".join(f"{x:.7g}f" for x in v)
+    vals = ", ".join(_cf(x) for x in v)
     return f"const float {name}[{len(v)}] = {{{vals}}};\n"
 
 
 def _arr2(name, m):
-    rows = ",\n  ".join("{" + ", ".join(f"{x:.7g}f" for x in r) + "}" for r in m)
+    rows = ",\n  ".join("{" + ", ".join(_cf(x) for x in r) + "}" for r in m)
     return f"const float {name}[{m.shape[0]}][{m.shape[1]}] = {{\n  {rows}\n}};\n"
 
 
