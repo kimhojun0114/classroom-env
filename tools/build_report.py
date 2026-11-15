@@ -12,11 +12,13 @@ ins = [
  ("### 4-3. 미리 대응하기", fig("mic_fft_test.png","그림 5. 소리 종류별 주파수 특징 검증 실험 — 크기(맨 위)로는 비슷한 소리가 주파수 특징으로 구분됨","66%"), "before"),
  ("**결과**\n\n| 방법 | 전체 MAE", fig("02_gd_learning_rate.png","그림 6. 학습률에 따른 경사하강 — η < 2/λmax 이면 수렴, 넘으면 발산","70%"), "before"),
  ("### 4-4. 생성형 AI를 활용한 최적 조건 탐색 결과", fig("02_forecast_curve.png","그림 7. 학습에 쓰지 않은 날(11/5)의 10분 뒤 CO₂ 예측"), "before"),
+ ("### 5-2. 주요 오류와 수정", fig("05_score_levels.png","그림 10. 환경 부담 점수 (학습에 쓰지 않은 라벨 구간) — 배경색 = 신호등 단계, 아래 띠 = 실제 상태"), "before"),
  ("**하루 환기 일정 제안**", '<div class="two">'+fig("04_window_ventilation.png","그림 8. 열린 창문 개수와 환기 속도 (82번)")+fig("04_optimal_map.png","그림 9. 인공신경망이 본 '최적' 확률 (검은 선 = 70%)")+'</div>', "before"),
 ]
 for key, html, pos in ins:
     i=md.index(key); md=md[:i]+html+md[i:]
 md=_re.sub(r"(?m)^(?!\s*(?:[-*] |[|>]|\d+\. ))(.+)\n(?=(- |\d+\. ))", r"\1\n\n", md)   # 목록 앞에 빈 줄
+md=_re.sub(r"(?m)^  - ", "    - ", md)
 body=markdown.markdown(md, extensions=["tables","md_in_html"])
 body=body.replace('<p>&lt;div class="two"&gt;</p>','<div class="two">')
 css='''@page { size: A4; margin: 14mm 15mm 14mm; @bottom-center { content: counter(page) " / " counter(pages); font-size: 8pt; color: #888; } }

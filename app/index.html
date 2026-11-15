@@ -132,6 +132,8 @@ details summary{cursor:pointer;color:var(--sub);font-size:14px}
       <label>지속 소음 기준 (LCD S값)<input type="number" id="loudLvl" step="50"></label>
       <label>최소 조도 (lx)<input type="number" id="luxLow" step="10"></label>
       <label>최고 온도 (℃)<input type="number" id="tMax" step="0.5"></label>
+      <label>노랑 기준 (환경 부담 점수 0~1)<input type="number" id="scoreWarn" step="0.05" min="0" max="1"></label>
+      <label>빨강 기준 (환경 부담 점수 0~1)<input type="number" id="scoreAlert" step="0.05" min="0" max="1"></label>
     </div>
     <button class="primary" id="saveCtl">설정 저장</button>
     <details style="margin-top:14px">
@@ -174,7 +176,7 @@ const store = {
   set(k,v){ try { localStorage.setItem(k,v); } catch(e){} }
 };
 let secret = store.get("fb_secret") || "";
-let control = { winMode:"auto", co2Drowsy:2000, co2Clear:1000, etaMin:10, noise30:6, loudLvl:500, luxLow:100, tMax:28 };
+let control = { winMode:"auto", co2Drowsy:2000, co2Clear:1000, etaMin:10, noise30:6, loudLvl:500, luxLow:100, tMax:28 , scoreWarn:0.4, scoreAlert:0.7 };
 const label = { focus:null, drowsy:null, sleeping:0 };
 
 function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2200); }
@@ -221,7 +223,8 @@ function renderLive(){
     $("#stateKo").textContent = live.state_ko || "–";
     $("#cause").textContent = live.cause ? `원인: ${live.cause}` : "환경이 양호해요";
     $("#eta").textContent = (live.eta_min!=null && live.eta_min >= 0 && live.eta_min < 60) ? `약 ${Math.round(live.eta_min)}분 뒤 졸음 임계값 도달 예상` : "";
-    $("#model").textContent = `판단: ${live.model==="mlp" ? "인공신경망" : "임시 규칙"} · 창문 모형 ${r.win ? "열림" : "닫힘"}${r.flag==="warmup" ? " · CO₂ 센서 예열 중" : ""}`;
+    const sc = (live.score ?? r.score);
+    $("#model").textContent = `판단: ${live.model==="mlp" ? "인공신경망" : "임시 규칙"}${sc!=null ? ` · 환경 부담 점수 ${sc.toFixed(2)} (노랑 ${control.scoreWarn} / 빨강 ${control.scoreAlert})` : ""} · 창문 모형 ${r.win ? "열림" : "닫힘"}${r.flag==="warmup" ? " · CO₂ 센서 예열 중" : ""}`;
     setTile("#tCo2", r.co2 ?? "–", r.co2 >= control.co2Drowsy);
     setTile("#tTemp", r.temp?.toFixed(1) ?? "–", r.temp > control.tMax || r.temp < 18);
     setTile("#tHum", r.hum?.toFixed(0) ?? "–", r.hum < 30 || r.hum > 80);
@@ -303,7 +306,7 @@ function drawChart(){
 }
 
 // ── 원격 조절 ──
-const ctlFields=["co2Drowsy","co2Clear","etaMin","noise30","loudLvl","luxLow","tMax"];
+const ctlFields=["co2Drowsy","co2Clear","etaMin","noise30","loudLvl","luxLow","tMax","scoreWarn","scoreAlert"];
 function showControl(){
   ctlFields.forEach(k=>$("#"+k).value=control[k]);
   document.querySelectorAll("#fanSeg button").forEach(b=>b.classList.toggle("sel", b.dataset.v===control.winMode));
@@ -354,7 +357,7 @@ $("#wAdd").onclick=async()=>{
 };
 
 // ── CSV 내려받기 ──
-const LOG_COLS=["time","ts","up","flag","co2","co2_pwm","temp","hum","lux","snd_mean","snd_std","snd_max","snd_spikes","snd_sp","snd_flat","snd_cent","reed","state","vent","win"];
+const LOG_COLS=["time","ts","up","flag","co2","co2_pwm","temp","hum","lux","snd_mean","snd_std","snd_max","snd_spikes","snd_sp","snd_flat","snd_cent","score","reed","state","vent","win"];
 const LABEL_COLS=["time","ts","focus","drowsy","sleeping","note"];
 const kst = ts => { const d=new Date((ts+9*3600)*1000); return d.toISOString().slice(0,19).replace("T"," "); };
 (function(){ const d=new Date(Date.now()+9*3600e3); $("#csvSince").value=d.toISOString().slice(0,10); })();

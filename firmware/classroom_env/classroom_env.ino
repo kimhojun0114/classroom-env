@@ -5,9 +5,12 @@
  * 하는 일
  *  1) 소리(MAX4466)는 50ms 창 단위로 계속 측정(8kHz 샘플링 + FFT로 주파수 특징 계산), CO2(UART·PWM 두 방식)·온습도·조도는 1초마다 측정
  *  2) 10초마다 평균을 내서 하나의 기록으로 만들고 Firebase 에 업로드
- *  3) 최근 10분 기록으로 특징 8개를 계산해 학습 상태(최적/졸림/산만)를 판단
- *     - USE_MLP 0 : 임시 규칙(데이터 수집 기간용)
- *     - USE_MLP 1 : 학습된 인공신경망(model_weights.h)
+ *  3) 최근 10분 기록으로 특징 8개를 계산해 '환경 부담 점수'(0~1)를 구하고 단계로 표시
+ *     - USE_MLP 1 : 점수 = 1 − 인공신경망이 계산한 '최적' 확률 (model_weights.h)
+ *     - USE_MLP 0 : 점수 = 규칙 판단을 숫자로 바꾼 값 (데이터 수집 기간용)
+ *     - 점수를 약 3분 동안 부드럽게(지수이동평균) 한 뒤
+ *       점수 < scoreWarn → 초록(양호), scoreWarn 이상 → 노랑(주의), scoreAlert 이상 → 빨강(경고)
+ *     - 원인(CO₂·조도·온습도·소음)은 LCD·웹앱 설명용으로 따로 표시
  *  4) 신호등 LED · LCD · 서보모터(창문 모형) 제어, 웹앱의 원격 설정(/control) 반영
  */
 #include <Arduino.h>
@@ -82,14 +85,16 @@ struct Control {
   float luxLow    = 100;    // 이보다 어두우면 '조명 부족' (학교보건법 300lx는 웹앱에서 조정)
   float tMin = 18, tMax = 28;   // 온도 기준(℃)
   float hMin = 30, hMax = 80;   // 습도 기준(%)
-  float loudLvl   = 500;    // 최근 5초 평균 소리 크기(진폭)가 이 이상이면 '계속 시끄러움' → 산만
-  float noise30   = 6;      // 최근 30초 급증 횟수가 이 이상이면 '산만' (2회 이하로 줄면 해제)
+  float loudLvl   = 500;    // 최근 5초 평균 소리 크기(진폭)가 이 이상이면 '계속 시끄러움' → 즉시 빨강
+  float noise30   = 6;      // 최근 30초 급증 횟수가 이 이상이면 즉시 빨강 (2회 이하로 줄면 해제)
+  float scoreWarn  = 0.4;   // 환경 부담 점수가 이 이상이면 노랑(주의)
+  float scoreAlert = 0.7;   // 이 이상이면 빨강(경고)
   String winMode  = "auto"; // 창문(서보): auto / on(열기) / off(닫기)
 } ctl;
 
 // ───────── 상태 ─────────
-enum State { ST_OPTIMAL = 0, ST_DROWSY = 1, ST_DISTRACTED = 2 };
-const char* STATE_KO[] = {"최적", "졸림", "산만"};
+enum State { ST_GOOD = 0, ST_CAUTION = 1, ST_ALERT = 2 };   // 초록 · 노랑 · 빨강
+const char* STATE_KO[] = {"양호", "주의", "경고"};   // 신호등 초록 · 노랑 · 빨강
 
 struct Rec {
   time_t ts;
@@ -373,15 +378,17 @@ int   lcdSpk = 0, lcdPage = 0;
 bool ventAlert = false, noisy = false, winOpen = false;
 int servoAngle = -1;
 Servo windowServo;
-State state = ST_OPTIMAL;
+State state = ST_GOOD;
 String causeKo = "", causeLcd = "OK";
 // 소음을 뺀 나머지 판단 결과 (10초마다 갱신)
-State baseState = ST_OPTIMAL;
+State baseState = ST_GOOD;
 String baseCauseKo = "", baseCauseLcd = "OK";
 uint32_t lastLcd = 0;
 void updateNoise();
 void drawLcd();
 float etaMin = -1;   // 졸음 임계값까지 예상 시간(분), -1 = 해당 없음
+float scoreRaw = NAN, scoreEma = NAN;   // 환경 부담 점수(이번 계산값, 부드럽게 한 값)
+const float SCORE_EMA = 0.05f;          // 10초마다 5%씩 따라감 → 약 3분 평균 효과
 
 #if USE_MLP
 int mlpPredict(const Features& f) {
@@ -410,6 +417,23 @@ int mlpPredict(const Features& f) {
   }
   return best;
 }
+
+// 환경 부담 점수 = 1 − P(최적). 출력값에 소프트맥스를 적용해 확률로 바꿈
+float mlpScore(const Features& f) {
+  float x[MLP_IN] = {f.sndMean, f.sndStd, f.sndSpikes, f.co2Mean, f.co2Slope, f.lux, f.temp, f.hum};
+  for (int i = 0; i < MLP_IN; i++) {
+    if (isnan(x[i])) x[i] = MLP_MEAN[i];
+    x[i] = (x[i] - MLP_MEAN[i]) / MLP_STD[i];
+  }
+  float h1[MLP_H1], h2[MLP_H2], o[MLP_OUT];
+  for (int j = 0; j < MLP_H1; j++) { float s = MLP_B1[j]; for (int i = 0; i < MLP_IN; i++) s += MLP_W1[j][i] * x[i]; h1[j] = s > 0 ? s : 0; }
+  for (int j = 0; j < MLP_H2; j++) { float s = MLP_B2[j]; for (int i = 0; i < MLP_H1; i++) s += MLP_W2[j][i] * h1[i]; h2[j] = s > 0 ? s : 0; }
+  float mx = -1e30f;
+  for (int j = 0; j < MLP_OUT; j++) { float s = MLP_B3[j]; for (int i = 0; i < MLP_H2; i++) s += MLP_W3[j][i] * h2[i]; o[j] = s; if (s > mx) mx = s; }
+  float sum = 0;
+  for (int j = 0; j < MLP_OUT; j++) { o[j] = expf(o[j] - mx); sum += o[j]; }
+  return 1.0f - o[0] / sum;
+}
 #endif
 
 void decide(const Features& f, float co2Now) {
@@ -428,19 +452,26 @@ void decide(const Features& f, float co2Now) {
   bool tLow    = !isnan(f.temp) && f.temp < ctl.tMin;
   bool hBad    = !isnan(f.hum)  && (f.hum < ctl.hMin || f.hum > ctl.hMax);
 
-  State ruleState = ST_OPTIMAL;   // 소음은 updateNoise()가 0.3초마다 따로 판단
-  if (ventAlert)        { ruleState = ST_DROWSY;     baseCauseKo = "CO2 상승 - 환기";   baseCauseLcd = "CO2 - VENTILATE"; }
-  else if (luxLow)      { ruleState = ST_DROWSY;     baseCauseKo = "조명 부족";         baseCauseLcd = "LIGHT LOW"; }
-  else if (tHigh)       { ruleState = ST_DROWSY;     baseCauseKo = "온도 높음";         baseCauseLcd = "TEMP HIGH"; }
-  else if (tLow)        { ruleState = ST_DISTRACTED; baseCauseKo = "온도 낮음";         baseCauseLcd = "TEMP LOW"; }
-  else if (hBad)        { ruleState = ST_DISTRACTED; baseCauseKo = "습도 부적절";       baseCauseLcd = "HUMIDITY"; }
-  else                  { baseCauseKo = "";                                            baseCauseLcd = "OK"; }
+  // 원인 설명(우선순위 순) — 신호등 색은 아래 점수로 정하고, 원인은 화면 설명에만 씀
+  float ruleScore = 0;            // 인공신경망을 쓰지 않을 때의 점수
+  if (ventAlert)        { ruleScore = 0.55f; baseCauseKo = "CO2 상승 - 환기";   baseCauseLcd = "CO2 - VENTILATE"; }
+  else if (luxLow)      { ruleScore = 0.55f; baseCauseKo = "조명 부족";         baseCauseLcd = "LIGHT LOW"; }
+  else if (tHigh)       { ruleScore = 0.55f; baseCauseKo = "온도 높음";         baseCauseLcd = "TEMP HIGH"; }
+  else if (tLow)        { ruleScore = 0.55f; baseCauseKo = "온도 낮음";         baseCauseLcd = "TEMP LOW"; }
+  else if (hBad)        { ruleScore = 0.55f; baseCauseKo = "습도 부적절";       baseCauseLcd = "HUMIDITY"; }
+  else                  { baseCauseKo = "";                                     baseCauseLcd = "OK"; }
 
+  // 환경 부담 점수 → 지수이동평균 → 단계
 #if USE_MLP
-  baseState = (State)mlpPredict(f);   // 상태는 인공신경망, 원인 설명은 규칙
+  scoreRaw = mlpScore(f);
 #else
-  baseState = ruleState;
+  scoreRaw = ruleScore;
 #endif
+  scoreEma = isnan(scoreEma) ? scoreRaw : scoreEma + SCORE_EMA * (scoreRaw - scoreEma);
+  baseState = scoreEma >= ctl.scoreAlert ? ST_ALERT : (scoreEma >= ctl.scoreWarn ? ST_CAUTION : ST_GOOD);
+  if (ventAlert && baseState == ST_GOOD) baseState = ST_CAUTION;      // 환기 알림 중에는 최소 노랑
+  if (baseState != ST_GOOD && baseCauseKo == "") { baseCauseKo = "여러 요인 복합"; baseCauseLcd = "MIXED FACTORS"; }
+  if (baseState == ST_GOOD && !ventAlert) { baseCauseKo = ""; baseCauseLcd = "OK"; }
 
   // 4) 창문(서보): 자동이면 환기 알림을 따라감
   if (ctl.winMode == "on") winOpen = true;
@@ -467,7 +498,7 @@ void drawLcd() {
   } else {
     // 2화면: 조도 · 소리 / 상태와 1분 급증 횟수
     snprintf(l1, sizeof(l1), "L%4dlx  S%4d", isnan(lcdLux) ? 0 : (int)lcdLux, (int)soundLevel(5));   // S = 최근 5초 평균 크기
-    const char* st[] = {"OPTIMAL", "DROWSY", "DISTRACT"};
+    const char* st[] = {"GOOD", "CAUTION", "ALERT"};
     snprintf(l2, sizeof(l2), "%-8s %2d/30s", st[state], lcdSpk);
   }
   lcdLine(0, l1); lcdLine(1, l2);
@@ -500,12 +531,12 @@ void updateNoise() {
     sp30 = 0;
   }
   State prev = state;
-  if (noisy && loudNow) { state = ST_DISTRACTED; causeKo = "계속 시끄러움";    causeLcd = "LOUD - QUIET"; }
-  else if (noisy)  { state = ST_DISTRACTED; causeKo = "말소리·소음 많음"; causeLcd = "NOISY - QUIET"; }
+  if (noisy && loudNow) { state = ST_ALERT; causeKo = "계속 시끄러움";    causeLcd = "LOUD - QUIET"; }
+  else if (noisy)  { state = ST_ALERT; causeKo = "말소리·소음 많음"; causeLcd = "NOISY - QUIET"; }
   else       { state = baseState;     causeKo = baseCauseKo;       causeLcd = baseCauseLcd; }
-  digitalWrite(PIN_LED_G, state == ST_OPTIMAL);
-  digitalWrite(PIN_LED_Y, state == ST_DROWSY);
-  digitalWrite(PIN_LED_R, state == ST_DISTRACTED);
+  digitalWrite(PIN_LED_G, state == ST_GOOD);
+  digitalWrite(PIN_LED_Y, state == ST_CAUTION);
+  digitalWrite(PIN_LED_R, state == ST_ALERT);
   lcdSpk = sp30;
   if (state != prev) { lcdPage = 0; drawLcd(); lastLcd = millis(); statePush = true; }   // 바뀌면 화면·웹 바로
 }
@@ -568,6 +599,8 @@ void fetchControl() {
   ctl.hMax      = doc["hMax"]      | ctl.hMax;
   ctl.noise30   = doc["noise30"]   | ctl.noise30;
   ctl.loudLvl   = doc["loudLvl"]   | ctl.loudLvl;
+  ctl.scoreWarn  = doc["scoreWarn"]  | ctl.scoreWarn;
+  ctl.scoreAlert = doc["scoreAlert"] | ctl.scoreAlert;
   const char* wm = doc["winMode"] | "auto";
   ctl.winMode = wm;
 }
@@ -637,6 +670,7 @@ void makeRecord() {
     ",\"snd_cent\":" + jnum(r.sndCent, 0) +
     ",\"reed\":\"" + reed + "\"" +
     ",\"state\":" + String((int)state) +
+    ",\"score\":" + jnum(scoreEma, 3) +
     ",\"vent\":" + (ventAlert ? "true" : "false") +
     ",\"win\":" + (winOpen ? "true" : "false") + "}";
 
@@ -644,6 +678,8 @@ void makeRecord() {
     ",\"state_ko\":\"" + STATE_KO[state] + "\"" +
     ",\"cause\":\"" + causeKo + "\"" +
     ",\"eta_min\":" + jnum(etaMin, 1) +
+    ",\"score\":" + jnum(scoreEma, 3) +
+    ",\"score_raw\":" + jnum(scoreRaw, 3) +
     ",\"model\":\"" + (USE_MLP ? "mlp" : "rule") + "\"" +
     ",\"feat\":{\"snd_mean\":" + jnum(f.sndMean) + ",\"snd_std\":" + jnum(f.sndStd) +
       ",\"snd_spikes\":" + jnum(f.sndSpikes, 0) + ",\"co2_mean\":" + jnum(f.co2Mean, 0) +
