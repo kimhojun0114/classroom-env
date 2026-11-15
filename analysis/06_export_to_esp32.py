@@ -12,13 +12,13 @@
 # | 항목 | 0점 → 1점 | 근거 |
 # |---|---|---|
 # | CO₂ (**10분 뒤 예측값**) | 1000 → 2500 ppm | 학교보건법 1000ppm, 04번 최적 확률 경계 약 2100ppm |
-# | 소음 (**소리 AI 복원 오차**, 최근 10분 평균) | 평소 소리 90% 수준 → 그 100배 (로그 눈금) | 05번 오토인코더 |
+# | 소음 (**소리 AI 복원 오차**, 최근 30초 평균) | 평소 소리 90% 수준 → 그 100배 (로그 눈금) | 05번 오토인코더 |
 # | 조명 (최근 10초) | 기준(luxLow) 이상 0, 미만이면 0.5부터 어두울수록 1 | 학교보건법 300lx(웹앱에서 조정) |
 # | 온도·습도 | 18~28℃, 30~80% 안이면 0, 벗어나면 0.5부터 | 학교보건법 |
 #
 # **합치는 방법:** 점수 = 1 − (1−w·s_CO₂)(1−s_소음)(1−s_조명)(1−s_온습도). 한 요인만 커도 점수가 오르고, 여러 요인이 조금씩 나쁘면 함께 쌓여 오른다('여러 요인 복합'). CO₂ 비중 **w는 사람이 남긴 라벨로 정한다**(아래 5번).
 #
-# **단계:** 점수(약 3분 지수이동평균) < 0.4 초록(양호), ≥ 0.4 노랑(주의), ≥ 0.7 빨강(경고). CO₂만 보면 10분 뒤 예측 1600ppm에서 노랑, 2050ppm에서 빨강이다.
+# **단계:** 점수(오를 때 빠르게·내릴 때 천천히 따라가는 평균) < 0.4 초록(양호), ≥ 0.4 노랑(주의), ≥ 0.7 빨강(경고). CO₂만 보면 10분 뒤 예측 1600ppm에서 노랑, 2050ppm에서 빨강이다.
 
 # %%
 import os, numpy as np, pandas as pd, joblib, matplotlib.pyplot as plt, matplotlib.dates as md
@@ -57,7 +57,14 @@ def co2_pred_series(df):
 rec["co2_pred10"] = co2_pred_series(rec).fillna(rec["co2"])
 snd = pd.read_csv(f"{PROC}/sound_ai.csv", encoding="utf-8-sig")
 rec = rec.merge(snd[["time", "s_snd_ai"]], on="time", how="left")
-rec["s_snd_ai10"] = rec.groupby("seg")["s_snd_ai"].transform(lambda s: s.rolling(60, min_periods=1).mean())   # 장치처럼 최근 10분 평균
+SND_N, UP, DOWN = 3, 0.5, 0.2   # 소리 AI 평균 30초, 점수가 오를 때 10초마다 50%·내릴 때 20%씩 따라감 — 7)에서 반응 속도와 정확도 비교
+def smooth(x, up=UP, down=DOWN):
+    out, v = [], None
+    for t in x.to_numpy():
+        v = t if v is None else v + (up if t > v else down) * (t - v)
+        out.append(v)
+    return pd.Series(out, index=x.index)
+rec["s_snd_ai10"] = rec.groupby("seg")["s_snd_ai"].transform(lambda s: s.rolling(SND_N, min_periods=1).mean())   # 장치처럼 최근 30초 평균
 
 # %% [markdown]
 # ## 3) 환경 부담 점수 계산 (펌웨어와 같은 식)
@@ -78,7 +85,7 @@ def env_score(df, w_co2=None):
     parts = pd.DataFrame({"CO₂(예측)": s_co2, "소음": s_snd, "조명": s_lux, "온습도": np.maximum(s_t, s_h)}, index=df.index).fillna(0)
     return 1 - (1 - parts).prod(axis=1), parts
 rec["score_raw"], parts = env_score(rec)
-rec["score"] = rec.groupby("seg")["score_raw"].transform(lambda s: s.ewm(alpha=0.05, adjust=False).mean())
+rec["score"] = rec.groupby("seg")["score_raw"].transform(lambda s: smooth(s))
 rec["level"] = np.select([rec.score >= .7, rec.score >= .4], [2, 1], 0)
 rec["cause"] = parts.idxmax(axis=1).where(rec.level > 0, "")
 
@@ -111,7 +118,7 @@ print("\n노랑·빨강일 때 가장 큰 원인:", rec.loc[rec.level > 0, "caus
 # %%
 def scored(w):
     sc_, _ = env_score(rec, w)
-    return sc_.groupby(rec["seg"]).transform(lambda s: s.ewm(alpha=0.05, adjust=False).mean())
+    return sc_.groupby(rec["seg"]).transform(lambda s: smooth(s))
 WS = np.round(np.arange(0, 1.0001, 0.05), 2)
 SC = {w: scored(w) for w in WS}
 yb = (rec["state_label"] == 2); g = rec["group"]
@@ -131,7 +138,7 @@ plt.tight_layout(); plt.savefig(f"{RES}/06_co2_weight.png", dpi=150); plt.show()
 
 # 정한 비중으로 다시 계산
 rec["score_raw"], parts = env_score(rec)
-rec["score"] = rec.groupby("seg")["score_raw"].transform(lambda s: s.ewm(alpha=0.05, adjust=False).mean())
+rec["score"] = rec.groupby("seg")["score_raw"].transform(lambda s: smooth(s))
 rec["level"] = np.select([rec.score >= .7, rec.score >= .4], [2, 1], 0)
 rec["cause"] = parts.idxmax(axis=1).where(rec.level > 0, "")
 L = rec[lab_mask]; y = L["state_label"].astype(int)
@@ -205,3 +212,25 @@ raw_snd = rec.dropna(subset=sa["feats"])
 py = pd.read_csv(f"{PROC}/sound_ai.csv", encoding="utf-8-sig").set_index("time")["s_snd_ai"].reindex(raw_snd["time"]).to_numpy()
 dv = ae_dev(raw_snd[sa["feats"]].to_numpy())
 print(f"{len(dv):,}개 기록에서 장치식 소음 부담과 파이썬 값의 최대 차이: {np.nanmax(np.abs(dv - py)):.2e}")
+
+# %% [markdown]
+# ## 7) 반응 속도와 정확도의 균형
+# 소리 AI를 오래 평균하고 점수를 천천히 따라가게 할수록 라벨(20분 단위 상태)과 잘 맞지만, 신호등 반응이 느려진다. 실제 장치에서 "조용해져도 몇 분 동안 빨강"이 문제가 되어, 평균 길이와 지수이동평균 계수를 바꿔 가며 라벨 구간 AUC(각 조합에서 CO₂ 비중을 다시 고른 값)를 비교했다.
+
+# %%
+rows = []
+for n_ in (60, 12, 6, 3):
+    snd_ = rec.groupby("seg")["s_snd_ai"].transform(lambda s: s.rolling(n_, min_periods=1).mean()).fillna(0)
+    for a_ in (0.05, 0.2, 0.4, "비대칭"):
+        best = (None, -1)
+        for w in WS:
+            sco = (w * np.clip((rec["co2_pred10"] - 1000) / 1500, 0, 1)).fillna(0)
+            raw_ = 1 - (1 - sco) * (1 - snd_) * (1 - parts["조명"]) * (1 - parts["온습도"])
+            S_ = raw_.groupby(rec["seg"]).transform((lambda s: smooth(s)) if a_ == "비대칭" else (lambda s: s.ewm(alpha=a_, adjust=False).mean()))
+            auc = roc_auc_score(yb[lab_mask], S_[lab_mask])
+            if auc > best[1]: best = (w, auc)
+        rows.append({"소리 평균": f"{n_*10//60}분" if n_ >= 6 else f"{n_*10}초", "EMA 계수": a_ if a_ != "비대칭" else f"오를 때 {UP} / 내릴 때 {DOWN}",
+                     "반응(약)": f"{int(round(10 / a_))}초" if a_ != "비대칭" else f"오름 {int(10/UP)}초 · 내림 {int(10/DOWN)}초",
+                     "CO₂ 비중": best[0], "AUC": round(best[1], 3)})
+tr_df = pd.DataFrame(rows); print(tr_df.to_string(index=False))
+tr_df.to_csv(f"{RES}/06_speed_tradeoff.csv", index=False, encoding="utf-8-sig")
