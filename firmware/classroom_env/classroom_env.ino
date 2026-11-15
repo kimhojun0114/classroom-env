@@ -9,7 +9,8 @@
  *     - CO₂ 10분 뒤 예측: USE_MLP 1 이면 인공신경망(co2_weights.h, 7일치로 학습), 0 이면 직선 연장
  *     - 소음 부담: USE_MLP 1 이면 소리 AI(snd_weights.h, '평소 소리'를 배운 오토인코더의 복원 오차), 0 이면 급증·크기 규칙
  *     - 항목별 부담(0~1): CO₂(예측값 1000→2500ppm), 소음(소리 AI 10분 평균), 조명(기준 미만), 온습도(기준 밖)
- *     - 점수 = 1 − Π(1 − 항목 부담)  → 약 3분 지수이동평균
+ *     - 점수 = 1 − (1 − 0.45·CO₂)(1 − 소음)(1 − 조명)(1 − 온습도)  → 약 3분 지수이동평균
+ *       (CO₂ 비중 0.45는 사람이 남긴 라벨로 정함: analysis/06_export_to_esp32)
  *     - 점수 < scoreWarn → 초록(양호), scoreWarn 이상 → 노랑(주의), scoreAlert 이상 → 빨강(경고)
  *     - 가장 큰 항목을 원인으로 LCD·웹앱에 표시, 아주 시끄러우면 0.3초 안에 즉시 빨강
  *  4) 신호등 LED · LCD · 서보모터(창문 모형) 제어, 웹앱의 원격 설정(/control) 반영
@@ -392,6 +393,7 @@ void drawLcd();
 float etaMin = -1;   // 졸음 임계값까지 예상 시간(분), -1 = 해당 없음
 float scoreRaw = NAN, scoreEma = NAN;   // 환경 부담 점수(이번 계산값, 부드럽게 한 값)
 const float SCORE_EMA = 0.05f;          // 10초마다 5%씩 따라감 → 약 3분 평균 효과
+const float CO2_WEIGHT = 0.45f;         // 점수에서 CO2 항목 비중 (라벨로 정함)
 
 // ───────── CO₂ 10분 뒤 예측 ─────────
 // 10초 기록 6개 → 1분 평균, 최근 16분 보관. 직전 3분 중앙값으로 다듬은 값의 1·2·5·10분 변화량을 신경망에 넣는다
@@ -488,12 +490,13 @@ void decide(const Features& f, float co2Now) {
   if (!isnan(f.hum)  && (f.hum < ctl.hMin  || f.hum > ctl.hMax))  sH = 0.5f + 0.5f * fminf(1, fmaxf(ctl.hMin - f.hum, f.hum - ctl.hMax) / 15);
 
   // 3) 환경 부담 점수 = 1 − Π(1 − 부담) → 지수이동평균 → 단계
-  scoreRaw = 1 - (1 - sCo2) * (1 - sSnd) * (1 - sLux) * (1 - fmaxf(sT, sH));
+  scoreRaw = 1 - (1 - CO2_WEIGHT * sCo2) * (1 - sSnd) * (1 - sLux) * (1 - fmaxf(sT, sH));
   scoreEma = isnan(scoreEma) ? scoreRaw : scoreEma + SCORE_EMA * (scoreRaw - scoreEma);
   baseState = scoreEma >= ctl.scoreAlert ? ST_ALERT : (scoreEma >= ctl.scoreWarn ? ST_CAUTION : ST_GOOD);
   if (ventAlert && baseState == ST_GOOD) baseState = ST_CAUTION;      // 환기 알림 중에는 최소 노랑
 
   // 4) 원인 설명: 가장 큰 항목
+  sCo2 *= CO2_WEIGHT;                                 // 원인 비교도 실제 반영 비중으로
   float mx = fmaxf(fmaxf(sCo2, sSnd), fmaxf(sLux, fmaxf(sT, sH)));
   if (baseState == ST_GOOD)       { baseCauseKo = "";                 baseCauseLcd = "OK"; }
   else if (mx < 0.25f)            { baseCauseKo = "여러 요인 복합";   baseCauseLcd = "MIXED FACTORS"; }

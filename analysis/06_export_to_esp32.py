@@ -16,7 +16,7 @@
 # | 조명 (최근 10초) | 기준(luxLow) 이상 0, 미만이면 0.5부터 어두울수록 1 | 학교보건법 300lx(웹앱에서 조정) |
 # | 온도·습도 | 18~28℃, 30~80% 안이면 0, 벗어나면 0.5부터 | 학교보건법 |
 #
-# **합치는 방법:** 점수 = 1 − (1−s_CO₂)(1−s_소음)(1−s_조명)(1−s_온습도). 한 요인만 커도 점수가 오르고, 여러 요인이 조금씩 나쁘면 함께 쌓여 오른다('여러 요인 복합').
+# **합치는 방법:** 점수 = 1 − (1−w·s_CO₂)(1−s_소음)(1−s_조명)(1−s_온습도). 한 요인만 커도 점수가 오르고, 여러 요인이 조금씩 나쁘면 함께 쌓여 오른다('여러 요인 복합'). CO₂ 비중 **w는 사람이 남긴 라벨로 정한다**(아래 5번).
 #
 # **단계:** 점수(약 3분 지수이동평균) < 0.4 초록(양호), ≥ 0.4 노랑(주의), ≥ 0.7 빨강(경고). CO₂만 보면 10분 뒤 예측 1600ppm에서 노랑, 2050ppm에서 빨강이다.
 
@@ -65,8 +65,10 @@ rec["s_snd_ai10"] = rec.groupby("seg")["s_snd_ai"].transform(lambda s: s.rolling
 # %%
 def ramp(x, a, b): return np.clip((x - a) / (b - a), 0, 1)
 LUX_LOW, TMIN, TMAX, HMIN, HMAX = 100, 18, 28, 30, 80
-def env_score(df):
-    s_co2 = ramp(df["co2_pred10"], 1000, 2500)
+W_CO2 = 1.0          # 5번에서 라벨로 다시 정함
+def env_score(df, w_co2=None):
+    w_co2 = W_CO2 if w_co2 is None else w_co2
+    s_co2 = w_co2 * ramp(df["co2_pred10"], 1000, 2500)
     s_snd = df["s_snd_ai10"]                          # 소리 AI (오토인코더 복원 오차 → 부담)
     lux = df["lux"]                                   # 장치와 같이 최근 10초 조도 사용
     s_lux = np.where(lux >= LUX_LOW, 0, 0.5 + 0.5 * np.clip((LUX_LOW - lux) / LUX_LOW, 0, 1))
@@ -101,13 +103,40 @@ print(share.iloc[::2].to_string())
 print("\n노랑·빨강일 때 가장 큰 원인:", rec.loc[rec.level > 0, "cause"].value_counts().to_dict())
 
 # %% [markdown]
-# ## 5) 사람이 남긴 라벨과 비교
+# ## 5) 사람이 남긴 라벨로 CO₂ 비중 정하기
+# 같은 비중(w = 1)으로 합치면 라벨 구간에서 점수와 실제 상태가 맞지 않았다. 이 2시간 동안 CO₂는 1500 → 2400ppm으로 계속 올랐지만 집중도는 오히려 높아졌기 때문이다. 짧은 시간에는 CO₂가 높아도 바로 산만해지지 않는다는 뜻이다.
+# 그래서 CO₂ 비중 w를 0~1에서 0.05 간격으로 바꿔 가며 라벨과 가장 잘 맞는 값을 찾는다.
+# - 정직한 평가를 위해 **라벨 하나를 빼고 나머지 8개로 w를 고른 뒤, 뺀 라벨로 평가**하는 것을 9번 반복한 결과도 함께 낸다.
 
 # %%
-L = rec[lab_mask]
-y = L["state_label"].astype(int)
-print(f"라벨 구간 AUC — 환경 부담 점수 {roc_auc_score(y == 2, L.score):.3f}")
+def scored(w):
+    sc_, _ = env_score(rec, w)
+    return sc_.groupby(rec["seg"]).transform(lambda s: s.ewm(alpha=0.05, adjust=False).mean())
+WS = np.round(np.arange(0, 1.0001, 0.05), 2)
+SC = {w: scored(w) for w in WS}
+yb = (rec["state_label"] == 2); g = rec["group"]
+auc_all = pd.Series({w: roc_auc_score(yb[lab_mask], SC[w][lab_mask]) for w in WS})
+oof = pd.Series(np.nan, index=rec.index); picks = []
+for k in sorted(g[lab_mask].unique()):
+    trm, tem = lab_mask & (g != k), lab_mask & (g == k)
+    wk = max(WS, key=lambda w: roc_auc_score(yb[trm], SC[w][trm])); picks.append(wk); oof[tem] = SC[wk][tem]
+W_CO2 = float(np.median(picks))
+print("라벨 하나씩 빼고 고른 w:", picks, "→ 중앙값", W_CO2)
+print(f"AUC — 같은 비중(w=1) {auc_all[1.0]:.3f} → w={W_CO2} {auc_all[W_CO2]:.3f} (비중을 정할 때 쓴 라벨로 잰 값)")
+print(f"라벨 하나씩 빼고 정한 뒤 뺀 라벨로 잰 AUC: {roc_auc_score(yb[lab_mask], oof[lab_mask]):.3f} (처음 보는 라벨 기준)")
+fig, a = plt.subplots(figsize=(6.5, 3.6))
+a.plot(auc_all.index, auc_all.values, "o-", color="#2b6cd8"); a.axvline(W_CO2, ls="--", color="#d64545")
+a.set_xlabel("CO₂ 비중 w"); a.set_ylabel("라벨 구간 AUC"); a.set_title(f"CO₂ 비중에 따른 점수와 실제 상태의 일치도 (선택 w = {W_CO2})"); a.grid(alpha=.25)
+plt.tight_layout(); plt.savefig(f"{RES}/06_co2_weight.png", dpi=150); plt.show()
+
+# 정한 비중으로 다시 계산
+rec["score_raw"], parts = env_score(rec)
+rec["score"] = rec.groupby("seg")["score_raw"].transform(lambda s: s.ewm(alpha=0.05, adjust=False).mean())
+rec["level"] = np.select([rec.score >= .7, rec.score >= .4], [2, 1], 0)
+rec["cause"] = parts.idxmax(axis=1).where(rec.level > 0, "")
+L = rec[lab_mask]; y = L["state_label"].astype(int)
 print(pd.crosstab(y.map(STATE_KO), L.level.map({0: "초록", 1: "노랑", 2: "빨강"}), normalize="index").round(2).to_string())
+print("\n하루 전체 신호등 비율:", (rec.level.value_counts(normalize=True).sort_index().rename({0: "초록", 1: "노랑", 2: "빨강"}) * 100).round(0).to_dict())
 
 # %% [markdown]
 # ## 6) CO₂ 예측 신경망 · 소리 AI를 C 헤더로 내보내기 + 검증
