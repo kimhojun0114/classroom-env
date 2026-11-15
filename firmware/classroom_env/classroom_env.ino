@@ -9,8 +9,8 @@
  *     - CO₂ 10분 뒤 예측: USE_MLP 1 이면 인공신경망(co2_weights.h, 7일치로 학습), 0 이면 직선 연장
  *     - 소음 부담: USE_MLP 1 이면 소리 AI(snd_weights.h, '평소 소리'를 배운 오토인코더의 복원 오차), 0 이면 급증·크기 규칙
  *     - 항목별 부담(0~1): CO₂(예측값 1000→2500ppm), 소음(소리 AI 10분 평균), 조명(기준 미만), 온습도(기준 밖)
- *     - 점수 = 1 − (1 − 0.45·CO₂)(1 − 소음)(1 − 조명)(1 − 온습도)  → 약 3분 지수이동평균
- *       (CO₂ 비중 0.45는 사람이 남긴 라벨로 정함: analysis/06_export_to_esp32)
+ *     - 점수 = 1 − (1 − 0.25·CO₂)(1 − 소음)(1 − 조명)(1 − 온습도)  → 약 3분 지수이동평균
+ *       (CO₂ 비중 0.25는 사람이 남긴 라벨로 정함: analysis/06_export_to_esp32)
  *     - 점수 < scoreWarn → 초록(양호), scoreWarn 이상 → 노랑(주의), scoreAlert 이상 → 빨강(경고)
  *     - 가장 큰 항목을 원인으로 LCD·웹앱에 표시, 아주 시끄러우면 0.3초 안에 즉시 빨강
  *  4) 신호등 LED · LCD · 서보모터(창문 모형) 제어, 웹앱의 원격 설정(/control) 반영
@@ -393,7 +393,7 @@ void drawLcd();
 float etaMin = -1;   // 졸음 임계값까지 예상 시간(분), -1 = 해당 없음
 float scoreRaw = NAN, scoreEma = NAN;   // 환경 부담 점수(이번 계산값, 부드럽게 한 값)
 const float SCORE_EMA = 0.05f;          // 10초마다 5%씩 따라감 → 약 3분 평균 효과
-const float CO2_WEIGHT = 0.45f;         // 점수에서 CO2 항목 비중 (라벨로 정함)
+const float CO2_WEIGHT = 0.25f;         // 점수에서 CO2 항목 비중 (라벨로 정함)
 
 // ───────── CO₂ 10분 뒤 예측 ─────────
 // 10초 기록 6개 → 1분 평균, 최근 16분 보관. 직전 3분 중앙값으로 다듬은 값의 1·2·5·10분 변화량을 신경망에 넣는다
@@ -446,6 +446,7 @@ float soundAiBurden(const Rec& r) {
   for (int i = 0; i < SNDN_IN; i++) if (isnan(x[i])) return NAN;
   x[0] = logf(fmaxf(x[0], 1)); x[1] = logf(fmaxf(x[1], 1)); x[2] = logf(fmaxf(x[2], 1)); x[6] = logf(fmaxf(x[6], 1));
   x[3] = log1pf(x[3]);
+  x[0] = fmaxf(x[0], SNDN_FLOOR_MEAN); x[1] = fmaxf(x[1], SNDN_FLOOR_STD); x[2] = fmaxf(x[2], SNDN_FLOOR_MAX);   // 평소보다 조용한 건 부담 아님
   float z[SNDN_IN], h1[SNDN_H1], h2[SNDN_H2], h3[SNDN_H3];
   for (int i = 0; i < SNDN_IN; i++) z[i] = (x[i] - SNDN_MEAN[i]) / SNDN_STD[i];
   for (int j = 0; j < SNDN_H1; j++) { float s = SNDN_B1[j]; for (int i = 0; i < SNDN_IN; i++) s += SNDN_W1[j][i] * z[i];  h1[j] = s > 0 ? s : 0; }

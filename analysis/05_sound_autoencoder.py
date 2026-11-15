@@ -8,6 +8,8 @@
 # - 자주 들은 '평소 소리'는 잘 복원하고, 처음 듣는 종류의 소리는 복원 오차가 커진다.
 # - 이 **복원 오차**를 소음 부담으로 쓴다.
 #
+# **조용한 쪽 보정:** 오토인코더는 '평소보다 조용한 소리'도 처음 보는 소리로 판단한다. 실제 장치를 밤에 켜 두자, 학습 때보다 조용했는데도 부담이 0.9 이상으로 나왔다. 그래서 소리 크기·변동·최댓값이 평소 수준(학습 데이터 중앙값)보다 작으면 평소 수준으로 맞춘 뒤 넣는다.
+#
 # **평가:** 소리 종류별 주파수 특징 검증 실험 구간(11/14 13:50~13:54: 조용·말소리·쉬이이·휘파람·키보드)은 학습에서 빼고 평가에만 쓴다. 사람이 남긴 라벨(최적·산만)과도 비교한다.
 
 # %%
@@ -20,17 +22,24 @@ from common import *
 SND = ["snd_mean", "snd_std", "snd_max", "snd_spikes", "snd_sp", "snd_flat", "snd_cent"]
 LOG = ["snd_mean", "snd_std", "snd_max", "snd_cent"]       # 크기 단위 값은 로그로 (큰 소리에 끌려가지 않게)
 
-def transform(df):
+LOUD = ["snd_mean", "snd_std", "snd_max"]                 # 크기 관련 값
+FLOOR = None                                               # 학습 데이터 중앙값(로그) — 아래에서 정함
+
+def transform(df, floor=True):
     X = df[SND].astype(float).copy()
     for c in LOG: X[c] = np.log(X[c].clip(lower=1))
     X["snd_spikes"] = np.log1p(X["snd_spikes"])
+    if floor and FLOOR is not None:                        # 평소보다 조용한 건 부담이 아니므로 평소 수준으로 맞춤
+        for c in LOUD: X[c] = np.maximum(X[c], FLOOR[c])
     return X
 
 d = pd.read_csv(f"{PROC}/records_clean.csv", encoding="utf-8-sig")
 d["t"] = pd.to_datetime(d["time"]).dt.tz_convert("Asia/Seoul").dt.tz_localize(None)
 d = d.dropna(subset=SND).reset_index(drop=True)
 TEST = (d.t >= "2026-11-14 13:50:30") & (d.t <= "2026-11-14 13:53:40")
-X = transform(d); tr = ~TEST.to_numpy()
+tr = ~TEST.to_numpy()
+FLOOR = transform(d, floor=False)[tr].median()             # 평소 소리 크기(학습 구간 중앙값)
+X = transform(d)
 print(f"학습 {tr.sum():,}개 (10초 기록) / 검증 실험 구간 {(~tr).sum()}개")
 
 # %% [markdown]
@@ -83,6 +92,9 @@ print(L.groupby("group").agg(상태=("state_label", lambda s: STATE_KO[int(s.ilo
 # ## 저장 (장치용 변환은 06번)
 
 # %%
-joblib.dump({"model": ae, "scaler": sc, "feats": SND, "log": LOG, "LO": LO, "HI": HI}, f"{PROC}/sound_ae.joblib")
+joblib.dump({"model": ae, "scaler": sc, "feats": SND, "log": LOG, "LO": LO, "HI": HI, "floor": FLOOR[LOUD].to_dict()}, f"{PROC}/sound_ae.joblib")
+quiet = pd.DataFrame([dict(snd_mean=155.1, snd_std=97.2, snd_max=306, snd_spikes=0, snd_sp=.253, snd_flat=.179, snd_cent=609)])
+Zq = sc.transform(transform(quiet)); eq = ((ae.predict(Zq) - Zq) ** 2).mean(axis=1)
+print(f"11/16 밤 장치 기록(학습 때보다 조용함)의 소음 부담: {sound_burden(eq)[0]:.3f}")
 d[["time", "ae_err", "s_snd_ai"]].to_csv(f"{PROC}/sound_ai.csv", index=False, encoding="utf-8-sig")
 print("저장 완료")

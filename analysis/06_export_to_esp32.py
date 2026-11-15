@@ -187,6 +187,7 @@ with open(path2, "w", encoding="utf-8") as f:
     f.write(arr1("SNDN_MEAN", ssc.mean_) + arr1("SNDN_STD", np.where(ssc.scale_ == 0, 1, ssc.scale_)))
     for k in range(4): f.write(arr2(f"SNDN_W{k+1}", Wa[k].T) + arr1(f"SNDN_B{k+1}", Ba[k]))
     f.write(f"const float SNDN_LO = {cf(sa['LO'])};\nconst float SNDN_HI = {cf(sa['HI'])};\n")
+    fl = sa["floor"]; f.write(f"// 평소 소리 크기(ln): 이보다 작으면 이 값으로 맞춤 (평소보다 조용한 건 부담 아님)\nconst float SNDN_FLOOR_MEAN = {cf(fl['snd_mean'])};\nconst float SNDN_FLOOR_STD = {cf(fl['snd_std'])};\nconst float SNDN_FLOOR_MAX = {cf(fl['snd_max'])};\n")
 print("저장:", path2, f"({os.path.getsize(path2)/1024:.1f} KB)")
 
 def ae_dev(Xr):                                     # 장치와 같은 32비트 계산
@@ -194,6 +195,7 @@ def ae_dev(Xr):                                     # 장치와 같은 32비트 
     for i, c in enumerate(sa["feats"]):
         if c in sa["log"]: x[:, i] = np.log(np.maximum(x[:, i], 1))
         if c == "snd_spikes": x[:, i] = np.log1p(x[:, i])
+        if c in sa["floor"]: x[:, i] = np.maximum(x[:, i], sa["floor"][c])
     z = ((x - ssc.mean_) / np.where(ssc.scale_ == 0, 1, ssc.scale_)).astype(f32); h = z
     for k in range(3): h = np.maximum(0, h @ Wa[k].astype(f32) + Ba[k].astype(f32))
     o = h @ Wa[3].astype(f32) + Ba[3].astype(f32)
