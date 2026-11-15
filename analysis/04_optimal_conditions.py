@@ -93,3 +93,42 @@ try:
     print(f"(학습 데이터 범위: CO₂ {lab.f_co2_mean.min():.0f}~{lab.f_co2_mean.max():.0f} ppm — 범위 밖은 외삽이라 신뢰도 낮음)")
 except FileNotFoundError:
     print("03번을 먼저 실행하세요")
+
+# %% [markdown]
+# ## 4) 라벨 없이 환경 상태 나누기 — k-평균 군집(k-means)
+# 24시간 동안의 10분 특징(CO₂·소리·조도·온습도·주파수)을 표준화한 뒤, 비슷한 기록끼리 k개 묶음으로 나눈다. 사람이 정답을 주지 않아도 장치가 겪은 '환경 상태'가 몇 가지로 나뉘는지 알 수 있다.
+# k는 실루엣 점수(묶음 안은 가깝고 묶음끼리는 먼 정도, 1에 가까울수록 좋음)로 고른다.
+
+# %%
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
+rc = pd.read_csv(f"{PROC}/records_clean.csv", encoding="utf-8-sig")
+rc["t"] = pd.to_datetime(rc["time"]).dt.tz_convert("Asia/Seoul").dt.tz_localize(None)
+KF = ["f_co2_mean", "f_co2_slope", "f_snd_mean", "f_snd_spikes", "f_lux", "f_temp", "f_hum", "f_snd_sp", "f_snd_flat", "f_snd_cent"]
+km_df = rc.dropna(subset=KF).copy()
+Zk = StandardScaler().fit_transform(km_df[KF])
+samp = np.random.default_rng(0).choice(len(Zk), size=min(3000, len(Zk)), replace=False)
+sil = {k: silhouette_score(Zk[samp], KMeans(k, n_init=10, random_state=0).fit_predict(Zk[samp])) for k in range(2, 7)}
+print("k별 실루엣 점수:", {k: round(v, 3) for k, v in sil.items()})
+K = max(sil, key=sil.get)
+km = KMeans(K, n_init=10, random_state=0).fit(Zk); km_df["군집"] = km.labels_
+desc = km_df.groupby("군집").agg(기록수=("ts", "size"), CO2=("f_co2_mean", "mean"), 조도=("f_lux", "mean"), 소리크기=("f_snd_mean", "mean"),
+                                급증=("f_snd_spikes", "mean"), 온도=("f_temp", "mean"), 말소리비율=("f_snd_sp", "mean"),
+                                주시간대=("t", lambda s: f"{s.dt.hour.mode()[0]}시")).round(1)
+print(f"\n선택한 k = {K}\n" + desc.to_string())
+lab_k = km_df[km_df["state_label"].notna()]
+if len(lab_k): print("\n라벨 구간의 군집 × 실제 상태\n" + pd.crosstab(lab_k["군집"], lab_k["state_label"].map(STATE_KO)).to_string())
+
+fig, ax = plt.subplots(1, 2, figsize=(13, 4), gridspec_kw={"width_ratios": [1, 2.4]})
+ax[0].plot(list(sil), list(sil.values()), "o-", color="#2b6cd8"); ax[0].axvline(K, ls="--", color="#d64545")
+ax[0].set_xlabel("묶음 개수 k"); ax[0].set_ylabel("실루엣 점수"); ax[0].set_title("k 고르기"); ax[0].grid(alpha=.25)
+pal = ["#2b6cd8", "#e0a800", "#2e9e5b", "#d64545", "#7b61ff", "#17a398"]
+for c in range(K):
+    m = km_df["군집"] == c
+    ax[1].scatter(km_df.loc[m, "t"], km_df.loc[m, "f_co2_mean"], s=3, color=pal[c], label=f"군집 {c}")
+ax[1].set_ylabel("CO₂ 10분 평균 (ppm)"); ax[1].set_title("k-평균 군집 결과 (시간에 따른 CO₂, 색 = 군집)"); ax[1].legend(markerscale=4, fontsize=8); ax[1].grid(alpha=.25)
+import matplotlib.dates as md
+ax[1].xaxis.set_major_formatter(md.DateFormatter("%m/%d %H:%M"))
+plt.tight_layout(); plt.savefig(f"{RES}/04_kmeans.png", dpi=150); plt.show()
+desc.to_csv(f"{RES}/04_kmeans_clusters.csv", encoding="utf-8-sig")

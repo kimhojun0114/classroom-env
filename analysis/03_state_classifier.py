@@ -4,7 +4,7 @@
 #
 # **비교할 방법**
 # - 기존 규칙: 데이터 수집 기간 동안 장치가 실제로 켠 신호등 색 (`state` 열)
-# - k-최근접 이웃(k-NN), 결정 트리, 로지스틱 회귀
+# - k-최근접 이웃(k-NN), 결정 트리, 로지스틱 회귀, SVM(서포트 벡터 머신), 랜덤 포레스트, 그레이디언트 부스팅
 # - **인공신경망(MLP)**: 은닉층 2개(16, 8), ReLU — 장치(ESP32)에 그대로 넣을 수 있는 구조
 #
 # **특징 묶음 비교:** 기본 8개(소리 크기·변동·급증, CO₂ 평균·기울기, 조도, 온도, 습도) vs **기본 8개 + 주파수 특징 3개**(말소리 대역 비율, 스펙트럼 평탄도, 스펙트럼 중심)
@@ -15,6 +15,8 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.tree import DecisionTreeClassifier, plot_tree
 from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import LeaveOneGroupOut
@@ -41,6 +43,9 @@ def models():
         "k-NN (k=15)": make_pipeline(StandardScaler(), KNeighborsClassifier(15)),
         "결정 트리 (깊이 3)": DecisionTreeClassifier(max_depth=3, random_state=0),
         "로지스틱 회귀": make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, C=.5)),
+        "SVM (RBF 커널)": make_pipeline(StandardScaler(), SVC(C=1.0, gamma="scale")),
+        "랜덤 포레스트 (나무 200그루)": RandomForestClassifier(n_estimators=200, max_depth=4, min_samples_leaf=10, random_state=0, n_jobs=-1),
+        "그레이디언트 부스팅": GradientBoostingClassifier(n_estimators=100, max_depth=2, learning_rate=.1, random_state=0),
         "인공신경망 MLP (16,8)": make_pipeline(StandardScaler(), MLPClassifier((16, 8), activation="relu", alpha=1e-2,
                                                                          max_iter=2000, random_state=0)),
     }

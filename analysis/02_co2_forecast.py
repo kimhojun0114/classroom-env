@@ -12,7 +12,8 @@
 # 1. 그대로 유지: 10분 뒤에도 지금 값 (가장 단순한 기준선)
 # 2. 직선 연장: 최근 10분 기울기를 그대로 이어감 (지금 펌웨어의 '임계값 도달 예상 시간' 방식)
 # 3. 선형회귀: 경사하강법을 손으로 유도해 학습 (손실함수 · 편미분 · 헤시안 · 고윳값 · 학습률 범위)
-# 4. **인공신경망(MLP)**: 은닉층 2개(32, 16), ReLU
+# 4. k-NN 회귀, 랜덤 포레스트 회귀 (머신러닝 비교 모델)
+# 5. **인공신경망(MLP)**: 은닉층 2개(16, 8), ReLU
 
 # %%
 import glob, numpy as np, pandas as pd, matplotlib.pyplot as plt
@@ -124,14 +125,16 @@ for a in ax: a.set_xlabel("반복 횟수"); a.set_ylabel("손실 (MSE)"); a.grid
 plt.tight_layout(); plt.savefig(f"{RES}/02_gd_learning_rate.png", dpi=150); plt.show()
 
 # %% [markdown]
-# ## 네 가지 방법 비교 (하루씩 빼서 평가)
+# ## 여섯 가지 방법 비교 (하루씩 빼서 평가)
 
 # %%
 def mlp_model():
     return MLPRegressor(hidden_layer_sizes=(16, 8), activation="relu", alpha=1e-2, learning_rate_init=1e-3,
                         max_iter=1500, early_stopping=True, validation_fraction=.15, random_state=0)
 
-P = {k: pd.Series(np.nan, index=X.index) for k in ["그대로 유지", "직선 연장(현재 펌웨어)", "선형회귀(경사하강)", "인공신경망(MLP)"]}
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.ensemble import RandomForestRegressor
+P = {k: pd.Series(np.nan, index=X.index) for k in ["그대로 유지", "직선 연장(현재 펌웨어)", "선형회귀(경사하강)", "k-NN 회귀 (k=25)", "랜덤 포레스트 회귀", "인공신경망(MLP)"]}
 for d in days:
     te = (day == d); tr = ~te
     sc = StandardScaler().fit(X.loc[tr, FEATS]); a, b = sc.transform(X.loc[tr, FEATS]), sc.transform(X.loc[te, FEATS])
@@ -140,6 +143,8 @@ for d in days:
     P["그대로 유지"][te] = 0.0
     P["직선 연장(현재 펌웨어)"][te] = X.loc[te, "d10"]
     P["선형회귀(경사하강)"][te] = np.hstack([b, np.ones((len(b), 1))]) @ w
+    P["k-NN 회귀 (k=25)"][te] = KNeighborsRegressor(25).fit(a, y[tr]).predict(b)
+    P["랜덤 포레스트 회귀"][te] = RandomForestRegressor(n_estimators=200, max_depth=8, min_samples_leaf=20, random_state=0, n_jobs=-1).fit(a, y[tr]).predict(b)
     P["인공신경망(MLP)"][te] = mlp_model().fit(a, y[tr]).predict(b)
 
 ev = day.isin(days)
