@@ -7,7 +7,8 @@
  *  2) 10초마다 평균을 내서 하나의 기록으로 만들고 Firebase 에 업로드
  *  3) 환경 부담 점수(0~1)를 계산해 신호등 3단계로 표시
  *     - CO₂ 10분 뒤 예측: USE_MLP 1 이면 인공신경망(co2_weights.h, 7일치로 학습), 0 이면 직선 연장
- *     - 항목별 부담(0~1): CO₂(예측값 1000→2500ppm), 소음(급증·크기), 조명(기준 미만), 온습도(기준 밖)
+ *     - 소음 부담: USE_MLP 1 이면 소리 AI(snd_weights.h, '평소 소리'를 배운 오토인코더의 복원 오차), 0 이면 급증·크기 규칙
+ *     - 항목별 부담(0~1): CO₂(예측값 1000→2500ppm), 소음(소리 AI 10분 평균), 조명(기준 미만), 온습도(기준 밖)
  *     - 점수 = 1 − Π(1 − 항목 부담)  → 약 3분 지수이동평균
  *     - 점수 < scoreWarn → 초록(양호), scoreWarn 이상 → 노랑(주의), scoreAlert 이상 → 빨강(경고)
  *     - 가장 큰 항목을 원인으로 LCD·웹앱에 표시, 아주 시끄러우면 0.3초 안에 즉시 빨강
@@ -46,7 +47,8 @@ Adafruit_SHT31 sht;
 #endif
 
 #if USE_MLP
-#include "co2_weights.h"     // CO2 10분 예측 인공신경망 가중치 (analysis/05_export_to_esp32)
+#include "co2_weights.h"     // CO2 10분 예측 인공신경망 가중치 (analysis/06_export_to_esp32)
+#include "snd_weights.h"     // 소리 AI(오토인코더) 가중치 (analysis/06_export_to_esp32)
 #endif
 
 // ───────── 핀 배치 ─────────
@@ -102,6 +104,7 @@ struct Rec {
   int   sndSpikes;
   float co2, co2pwm, temp, hum, lux;
   float sndSp, sndFlat, sndCent;    // 주파수 특징
+  float sndAi;                      // 소리 AI 부담(0~1), USE_MLP 0 이면 NAN
 };
 Rec buf[BUF_N];
 int bufCount = 0, bufHead = 0;   // bufHead = 다음에 쓸 위치
@@ -434,6 +437,31 @@ float predictCo2In10(float co2Now, float slope5) {
   return isnan(co2Now) ? NAN : co2Now + slope5 * 10;          // 기록이 모자라면 직선 연장
 }
 
+#if USE_MLP
+// 소리 AI: 10초 소리 특징 7개 → 오토인코더(7→8→3→8→7) → 복원 오차 → 부담(0~1)
+float soundAiBurden(const Rec& r) {
+  float x[SNDN_IN] = {r.sndMean, r.sndStd, r.sndMax, (float)r.sndSpikes, r.sndSp, r.sndFlat, r.sndCent};
+  for (int i = 0; i < SNDN_IN; i++) if (isnan(x[i])) return NAN;
+  x[0] = logf(fmaxf(x[0], 1)); x[1] = logf(fmaxf(x[1], 1)); x[2] = logf(fmaxf(x[2], 1)); x[6] = logf(fmaxf(x[6], 1));
+  x[3] = log1pf(x[3]);
+  float z[SNDN_IN], h1[SNDN_H1], h2[SNDN_H2], h3[SNDN_H3];
+  for (int i = 0; i < SNDN_IN; i++) z[i] = (x[i] - SNDN_MEAN[i]) / SNDN_STD[i];
+  for (int j = 0; j < SNDN_H1; j++) { float s = SNDN_B1[j]; for (int i = 0; i < SNDN_IN; i++) s += SNDN_W1[j][i] * z[i];  h1[j] = s > 0 ? s : 0; }
+  for (int j = 0; j < SNDN_H2; j++) { float s = SNDN_B2[j]; for (int i = 0; i < SNDN_H1; i++) s += SNDN_W2[j][i] * h1[i]; h2[j] = s > 0 ? s : 0; }
+  for (int j = 0; j < SNDN_H3; j++) { float s = SNDN_B3[j]; for (int i = 0; i < SNDN_H2; i++) s += SNDN_W3[j][i] * h2[i]; h3[j] = s > 0 ? s : 0; }
+  float e = 0;
+  for (int j = 0; j < SNDN_IN; j++) { float s = SNDN_B4[j]; for (int i = 0; i < SNDN_H3; i++) s += SNDN_W4[j][i] * h3[i]; e += (s - z[j]) * (s - z[j]); }
+  e /= SNDN_IN;
+  float b = log10f(fmaxf(e, 1e-9f) / SNDN_LO) / log10f(SNDN_HI / SNDN_LO);
+  return b < 0 ? 0 : (b > 1 ? 1 : b);
+}
+#endif
+float sndAiAvg() {                          // 최근 10분(버퍼 전체) 소리 AI 부담 평균
+  float s = 0; int n = 0;
+  for (int k = 0; k < bufCount; k++) { float v = recAgo(k).sndAi; if (!isnan(v)) { s += v; n++; } }
+  return n ? s / n : NAN;
+}
+
 float rampf(float x, float a, float b) { if (isnan(x)) return 0; float t = (x - a) / (b - a); return t < 0 ? 0 : (t > 1 ? 1 : t); }
 
 void decide(const Features& f, float co2Now) {
@@ -451,7 +479,8 @@ void decide(const Features& f, float co2Now) {
 
   // 2) 항목별 부담(0~1)
   float sCo2 = rampf(isnan(co2Pred10) ? co2Now : co2Pred10, 1000, 2500);
-  float sSnd = fmaxf(rampf(f.sndSpikes, 5, 40), rampf(f.sndMean, 250, 600));
+  float sSnd = sndAiAvg();                           // 소리 AI (최근 10분 평균)
+  if (isnan(sSnd)) sSnd = fmaxf(rampf(f.sndSpikes, 5, 40), rampf(f.sndMean, 250, 600));   // AI 없으면 규칙
   float lux = lcdLux;                                 // 최근 10초 조도 (불을 켜면 바로 반영)
   float sLux = (isnan(lux) || lux >= ctl.luxLow) ? 0 : 0.5f + 0.5f * fminf(1, (ctl.luxLow - lux) / ctl.luxLow);
   float sT = 0, sH = 0;
@@ -625,6 +654,11 @@ void makeRecord() {
   r.sndSp   = sw > 0 ? ssp / sw : NAN;
   r.sndFlat = sw > 0 ? sfl / sw : NAN;
   r.sndCent = sw > 0 ? sct / sw : NAN;
+#if USE_MLP
+  r.sndAi = soundAiBurden(r);
+#else
+  r.sndAi = NAN;
+#endif
   r.sndMean = n ? s / n : NAN;
   r.sndStd  = n ? sqrtf(fmaxf(sq / n - r.sndMean * r.sndMean, 0)) : NAN;
   r.sndMax  = mx;
@@ -674,6 +708,7 @@ void makeRecord() {
     ",\"state\":" + String((int)state) +
     ",\"score\":" + jnum(scoreEma, 3) +
     ",\"co2_pred10\":" + jnum(co2Pred10, 0) +
+    ",\"snd_ai\":" + jnum(r.sndAi, 3) +
     ",\"vent\":" + (ventAlert ? "true" : "false") +
     ",\"win\":" + (winOpen ? "true" : "false") + "}";
 
@@ -684,6 +719,7 @@ void makeRecord() {
     ",\"score\":" + jnum(scoreEma, 3) +
     ",\"score_raw\":" + jnum(scoreRaw, 3) +
     ",\"co2_pred10\":" + jnum(co2Pred10, 0) +
+    ",\"snd_ai10\":" + jnum(sndAiAvg(), 3) +
     ",\"model\":\"" + (USE_MLP ? "mlp" : "rule") + "\"" +
     ",\"feat\":{\"snd_mean\":" + jnum(f.sndMean) + ",\"snd_std\":" + jnum(f.sndStd) +
       ",\"snd_spikes\":" + jnum(f.sndSpikes, 0) + ",\"co2_mean\":" + jnum(f.co2Mean, 0) +

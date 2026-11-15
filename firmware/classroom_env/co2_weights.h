@@ -1,4 +1,4 @@
-// 자동 생성 파일 — analysis/05_export_to_esp32.py
+// 자동 생성 파일 — analysis/06_export_to_esp32.py
 // CO2 10분 뒤 변화량 예측 MLP. 입력 순서: d1, d2, d5, d10, win, dwin
 #pragma once
 #define CO2N_IN 6

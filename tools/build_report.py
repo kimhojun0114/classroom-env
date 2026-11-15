@@ -9,11 +9,12 @@ ins = [
    fig("01_co2_uart_vs_pwm.png","그림 2. 같은 CO₂ 센서를 UART와 PWM 두 방식으로 읽은 값 비교","72%")+
    fig("04_classroom_daily_profile.png","그림 3. 7반 교실 시간대별 평균 CO₂ (5일)","88%"), "before"),
  ("**분석**\n- **기존 규칙의 오판", fig("03_confusion.png","그림 4. 혼동 행렬 — 기존 규칙은 실제로 졸리지 않았던 시간을 대부분 '졸림'으로 판단함"), "before"),
- ("### 4-3. 미리 대응하기", fig("mic_fft_test.png","그림 5. 소리 종류별 주파수 특징 검증 실험 — 크기(맨 위)로는 비슷한 소리가 주파수 특징으로 구분됨","66%"), "before"),
- ("**결과**\n\n| 방법 | 전체 MAE", fig("02_gd_learning_rate.png","그림 6. 학습률에 따른 경사하강 — η < 2/λmax 이면 수렴, 넘으면 발산","70%"), "before"),
- ("### 4-4. 생성형 AI를 활용한 최적 조건 탐색 결과", fig("02_forecast_curve.png","그림 7. 학습에 쓰지 않은 날(11/5)의 10분 뒤 CO₂ 예측"), "before"),
- ("### 5-2. 주요 오류와 수정", fig("05_env_score_timeline.png","그림 10. 24시간 기록에 적용한 환경 부담 점수(검은 선)와 상태 분류 신경망 점수(보라, 비교용) — 배경색 = 신호등 단계"), "before"),
- ("**하루 환기 일정 제안**", '<div class="two">'+fig("04_window_ventilation.png","그림 8. 열린 창문 개수와 환기 속도 (82번)")+fig("04_optimal_map.png","그림 9. 인공신경망이 본 '최적' 확률 (검은 선 = 70%)")+'</div>', "before"),
+ ("### 4-3. 소리 AI", fig("mic_fft_test.png","그림 5. 소리 종류별 주파수 특징 검증 실험 — 크기(맨 위)로는 비슷한 소리가 주파수 특징으로 구분됨","66%"), "before"),
+ ("**결과**\n\n| 방법 | 전체 MAE", fig("02_gd_learning_rate.png","그림 7. 학습률에 따른 경사하강 — η < 2/λmax 이면 수렴, 넘으면 발산","70%"), "before"),
+ ("### 4-4. 미리 대응하기", fig("05_sound_ai_test.png","그림 6. 학습에서 뺀 소리 실험 구간의 소음 부담 — 소리 AI는 조용해지면 바로 내려감","62%"), "before"),
+ ("### 4-5. 생성형 AI를 활용한 최적 조건 탐색 결과", fig("02_forecast_curve.png","그림 8. 학습에 쓰지 않은 날(11/5)의 10분 뒤 CO₂ 예측"), "before"),
+ ("### 5-2. 주요 오류와 수정", fig("06_env_score_timeline.png","그림 11. 24시간 기록에 적용한 환경 부담 점수(검은 선, CO₂ 예측 신경망 + 소리 AI + 법정 기준)와 상태 분류 신경망 점수(보라, 비교용)"), "before"),
+ ("**하루 환기 일정 제안**", '<div class="two">'+fig("04_window_ventilation.png","그림 9. 열린 창문 개수와 환기 속도 (82번)")+fig("04_optimal_map.png","그림 10. 인공신경망이 본 '최적' 확률 (검은 선 = 70%)")+'</div>', "before"),
 ]
 for key, html, pos in ins:
     i=md.index(key); md=md[:i]+html+md[i:]

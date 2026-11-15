@@ -101,6 +101,7 @@ details summary{cursor:pointer;color:var(--sub);font-size:14px}
       <div class="tile" id="tLux"><div class="k">조도</div><span class="v">–</span><span class="u">lx</span></div>
       <div class="tile" id="tSnd"><div class="k">소리 크기 / 변동</div><span class="v">–</span></div>
       <div class="tile" id="tSpk"><div class="k">급증(최근 10분 합계)</div><span class="v">–</span><span class="u">회</span></div>
+      <div class="tile" id="tAi"><div class="k">소리 AI: 평소와 다른 정도</div><span class="v">–</span><span class="u">/ 100</span></div>
     </div>
   </section>
 
@@ -239,13 +240,14 @@ function renderLive(){
     const predTxt = (live.co2_pred10!=null) ? `10분 뒤 CO₂ 예측 ${Math.round(live.co2_pred10)} ppm${live.model==="mlp" ? " (인공신경망)" : ""}` : "";
     $("#eta").textContent = [predTxt, etaTxt].filter(Boolean).join(" · ");
     const sc = (live.score ?? r.score);
-    $("#model").textContent = `판단: ${live.model==="mlp" ? "인공신경망 CO₂ 예측 + 환경 부담 점수" : "환경 부담 점수(직선 예측)"} · 창문 모형 ${r.win ? "열림" : "닫힘"}${r.flag==="warmup" ? " · CO₂ 센서 예열 중" : ""}`;
+    $("#model").textContent = `판단: ${live.model==="mlp" ? "인공신경망(CO₂ 예측 · 소리 AI) + 환경 부담 점수" : "환경 부담 점수(직선 예측)"} · 창문 모형 ${r.win ? "열림" : "닫힘"}${r.flag==="warmup" ? " · CO₂ 센서 예열 중" : ""}`;
     setTile("#tCo2", r.co2 ?? "–", r.co2 >= control.co2Drowsy);
     setTile("#tTemp", r.temp?.toFixed(1) ?? "–", r.temp > control.tMax || r.temp < 18);
     setTile("#tHum", r.hum?.toFixed(0) ?? "–", r.hum < 30 || r.hum > 80);
     setTile("#tLux", r.lux?.toFixed(0) ?? "–", r.lux < control.luxLow);
     setTile("#tSnd", `${r.snd_mean?.toFixed(0) ?? "–"} / ${r.snd_std?.toFixed(0) ?? "–"}`);
     setTile("#tSpk", f.snd_spikes ?? "–");
+    setTile("#tAi", live.snd_ai10!=null ? Math.round(live.snd_ai10*100) : "–", live.snd_ai10 >= 0.5);
     setTile("#tPred", live.co2_pred10!=null ? Math.round(live.co2_pred10) : "–", live.co2_pred10 >= control.co2Drowsy);
     if(sc!=null){ $("#scoreV").textContent = sc.toFixed(2); $("#needle").style.left = `calc(${Math.min(1,Math.max(0,sc))*100}% - 2px)`; }
     const zw=$(".zone.g"), zy=$(".zone.y"); zw.style.flexBasis=`${control.scoreWarn*100}%`; zy.style.flexBasis=`${(control.scoreAlert-control.scoreWarn)*100}%`;
@@ -376,7 +378,7 @@ $("#wAdd").onclick=async()=>{
 };
 
 // ── CSV 내려받기 ──
-const LOG_COLS=["time","ts","up","flag","co2","co2_pwm","temp","hum","lux","snd_mean","snd_std","snd_max","snd_spikes","snd_sp","snd_flat","snd_cent","score","co2_pred10","reed","state","vent","win"];
+const LOG_COLS=["time","ts","up","flag","co2","co2_pwm","temp","hum","lux","snd_mean","snd_std","snd_max","snd_spikes","snd_sp","snd_flat","snd_cent","score","co2_pred10","snd_ai","reed","state","vent","win"];
 const LABEL_COLS=["time","ts","focus","drowsy","sleeping","note"];
 const kst = ts => { const d=new Date((ts+9*3600)*1000); return d.toISOString().slice(0,19).replace("T"," "); };
 (function(){ const d=new Date(Date.now()+9*3600e3); $("#csvSince").value=d.toISOString().slice(0,10); })();

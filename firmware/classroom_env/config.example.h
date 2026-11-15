@@ -38,5 +38,5 @@
 // 핀 순서: 13, 14, 18, 19, 32, 33, 5, 15  (스위치 한쪽은 핀, 다른 쪽은 GND)
 #define REED_COUNT 0
 
-// 1 = CO2 10분 예측 인공신경망 사용 (co2_weights.h 필요, analysis/05_export_to_esp32 가 생성). 0 = 직선 연장
+// 1 = 인공신경망 사용: CO2 10분 예측(co2_weights.h) + 소리 AI(snd_weights.h), analysis/06_export_to_esp32 가 생성. 0 = 규칙
 #define USE_MLP 0

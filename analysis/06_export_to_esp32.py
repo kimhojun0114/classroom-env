@@ -1,16 +1,18 @@
 # %% [markdown]
-# # 05. 장치에 인공신경망 넣기 — 환경 부담 점수로 신호등 켜기
+# # 06. 장치에 인공신경망 넣기 — 환경 부담 점수로 신호등 켜기
 #
 # ## 왜 상태 분류 신경망을 그대로 넣지 않았나
 # 03번의 상태 분류 MLP는 11/14 오후 2시간(라벨 9개) 동안의 조건(온도 23.05~23.58℃, 조도 약 200lx)만 보고 배웠다. 그 범위를 조금만 벗어나도(밤 기온 22℃, 불 끈 방 등) 출력이 0이나 1로 쏠려 신호등이 계속 한 색으로 켜졌다(아래 1번에서 확인). 그래서 장치에는
 #
-# 1. **7일치 기록(5,551개 시점)으로 학습하고 처음 보는 날로 검증한 CO₂ 10분 예측 신경망(02번)**을 넣고,
-# 2. 그 예측값과 다른 센서 값을 **0~1 부담 점수로 바꿔 합치는 공식**으로 환경 부담 점수를 만든다.
+# 1. **CO₂ 10분 예측 신경망(02번)** — 7일치(5,551개 시점)로 학습, 처음 보는 날로 검증
+# 2. **소리 AI 오토인코더(05번)** — 24시간 소리로 '평소 소리'를 학습, 처음 듣는 소리 실험으로 검증
+#
+# 을 넣고, 두 AI의 출력과 법정 기준이 있는 조명·온습도를 **0~1 부담으로 바꿔 합치는 공식**으로 환경 부담 점수를 만든다.
 #
 # | 항목 | 0점 → 1점 | 근거 |
 # |---|---|---|
 # | CO₂ (**10분 뒤 예측값**) | 1000 → 2500 ppm | 학교보건법 1000ppm, 04번 최적 확률 경계 약 2100ppm |
-# | 소음 | 10분 급증 5 → 40회, 평균 크기 250 → 600 중 큰 값 | 조용할 때 크기 약 210, 지속 소음 기준 500 |
+# | 소음 (**소리 AI 복원 오차**, 최근 10분 평균) | 평소 소리 90% 수준 → 그 100배 (로그 눈금) | 05번 오토인코더 |
 # | 조명 (최근 10초) | 기준(luxLow) 이상 0, 미만이면 0.5부터 어두울수록 1 | 학교보건법 300lx(웹앱에서 조정) |
 # | 온도·습도 | 18~28℃, 30~80% 안이면 0, 벗어나면 0.5부터 | 학교보건법 |
 #
@@ -53,6 +55,9 @@ def co2_pred_series(df):
         out.loc[g.index] = pred.reindex(g["t"].dt.floor("1min")).to_numpy()
     return out
 rec["co2_pred10"] = co2_pred_series(rec).fillna(rec["co2"])
+snd = pd.read_csv(f"{PROC}/sound_ai.csv", encoding="utf-8-sig")
+rec = rec.merge(snd[["time", "s_snd_ai"]], on="time", how="left")
+rec["s_snd_ai10"] = rec.groupby("seg")["s_snd_ai"].transform(lambda s: s.rolling(60, min_periods=1).mean())   # 장치처럼 최근 10분 평균
 
 # %% [markdown]
 # ## 3) 환경 부담 점수 계산 (펌웨어와 같은 식)
@@ -62,7 +67,7 @@ def ramp(x, a, b): return np.clip((x - a) / (b - a), 0, 1)
 LUX_LOW, TMIN, TMAX, HMIN, HMAX = 100, 18, 28, 30, 80
 def env_score(df):
     s_co2 = ramp(df["co2_pred10"], 1000, 2500)
-    s_snd = np.maximum(ramp(df["f_snd_spikes"], 5, 40), ramp(df["f_snd_mean"], 250, 600))
+    s_snd = df["s_snd_ai10"]                          # 소리 AI (오토인코더 복원 오차 → 부담)
     lux = df["lux"]                                   # 장치와 같이 최근 10초 조도 사용
     s_lux = np.where(lux >= LUX_LOW, 0, 0.5 + 0.5 * np.clip((LUX_LOW - lux) / LUX_LOW, 0, 1))
     t, h = df["f_temp"], df["f_hum"]
@@ -89,7 +94,7 @@ ax[1].plot(rec.t, rec.co2, color="#2b6cd8", lw=1, label="현재 CO₂"); ax[1].p
 ax[1].set_ylabel("CO₂ (ppm)"); ax[1].legend(fontsize=8); ax[1].grid(alpha=.25)
 ax[1].xaxis.set_major_formatter(md.DateFormatter("%m/%d %H:%M"))
 ax[0].set_title("환경 부담 점수와 신호등 단계 (11/14~15 전체 기록)")
-plt.tight_layout(); plt.savefig(f"{RES}/05_env_score_timeline.png", dpi=150); plt.show()
+plt.tight_layout(); plt.savefig(f"{RES}/06_env_score_timeline.png", dpi=150); plt.show()
 
 share = rec.groupby(rec.t.dt.strftime("%m/%d %H시"))["level"].agg(lambda s: f"초록 {(s==0).mean()*100:.0f}% 노랑 {(s==1).mean()*100:.0f}% 빨강 {(s==2).mean()*100:.0f}%")
 print(share.iloc[::2].to_string())
@@ -105,7 +110,7 @@ print(f"라벨 구간 AUC — 환경 부담 점수 {roc_auc_score(y == 2, L.scor
 print(pd.crosstab(y.map(STATE_KO), L.level.map({0: "초록", 1: "노랑", 2: "빨강"}), normalize="index").round(2).to_string())
 
 # %% [markdown]
-# ## 6) CO₂ 예측 신경망을 C 헤더로 내보내기 + 검증
+# ## 6) CO₂ 예측 신경망 · 소리 AI를 C 헤더로 내보내기 + 검증
 
 # %%
 m, sc = co2m["model"], co2m["scaler"]
@@ -119,7 +124,7 @@ def arr2(n, M):
     return f"const float {n}[{M.shape[0]}][{M.shape[1]}] = {{\n  {rows}\n}};\n"
 path = os.path.join(ROOT, "firmware/classroom_env/co2_weights.h")
 with open(path, "w", encoding="utf-8") as f:
-    f.write("// 자동 생성 파일 — analysis/05_export_to_esp32.py\n// CO2 10분 뒤 변화량 예측 MLP. 입력 순서: " + ", ".join(co2m["feats"]) + "\n#pragma once\n")
+    f.write("// 자동 생성 파일 — analysis/06_export_to_esp32.py\n// CO2 10분 뒤 변화량 예측 MLP. 입력 순서: " + ", ".join(co2m["feats"]) + "\n#pragma once\n")
     f.write(f"#define CO2N_IN {W[0].shape[0]}\n#define CO2N_H1 {W[0].shape[1]}\n#define CO2N_H2 {W[1].shape[1]}\n")
     f.write(arr1("CO2N_MEAN", sc.mean_) + arr1("CO2N_STD", np.where(sc.scale_ == 0, 1, sc.scale_)))
     f.write(arr2("CO2N_W1", W[0].T) + arr1("CO2N_B1", B[0]) + arr2("CO2N_W2", W[1].T) + arr1("CO2N_B2", B[1]))
@@ -139,3 +144,33 @@ hh = np.maximum(0, z @ W[0].astype(f32) + B[0].astype(f32)); hh = np.maximum(0, 
 dev = hh @ W[2][:, 0].astype(f32) + f32(B[2][0])
 print(f"{len(Xs):,}개 입력에서 장치식 계산과 파이썬 예측의 최대 차이: {np.abs(dev - m.predict(sc.transform(Xs))).max():.2e} ppm")
 rec[["time", "co2", "co2_pred10", "score_raw", "score", "level", "cause"]].to_csv(f"{PROC}/env_score.csv", index=False, encoding="utf-8-sig")
+
+# %% [markdown]
+# ### 소리 AI (오토인코더 7 → 8 → 3 → 8 → 7)
+
+# %%
+sa = joblib.load(f"{PROC}/sound_ae.joblib"); ae, ssc = sa["model"], sa["scaler"]
+Wa = [np.asarray(w) for w in ae.coefs_]; Ba = [np.asarray(b) for b in ae.intercepts_]
+path2 = os.path.join(ROOT, "firmware/classroom_env/snd_weights.h")
+with open(path2, "w", encoding="utf-8") as f:
+    f.write("// 자동 생성 파일 — analysis/06_export_to_esp32.py\n// 소리 오토인코더. 입력 순서: " + ", ".join(sa["feats"]) + " (mean·std·max·cent 는 ln, spikes 는 ln(1+x))\n#pragma once\n")
+    f.write(f"#define SNDN_IN {Wa[0].shape[0]}\n#define SNDN_H1 {Wa[0].shape[1]}\n#define SNDN_H2 {Wa[1].shape[1]}\n#define SNDN_H3 {Wa[2].shape[1]}\n")
+    f.write(arr1("SNDN_MEAN", ssc.mean_) + arr1("SNDN_STD", np.where(ssc.scale_ == 0, 1, ssc.scale_)))
+    for k in range(4): f.write(arr2(f"SNDN_W{k+1}", Wa[k].T) + arr1(f"SNDN_B{k+1}", Ba[k]))
+    f.write(f"const float SNDN_LO = {cf(sa['LO'])};\nconst float SNDN_HI = {cf(sa['HI'])};\n")
+print("저장:", path2, f"({os.path.getsize(path2)/1024:.1f} KB)")
+
+def ae_dev(Xr):                                     # 장치와 같은 32비트 계산
+    x = Xr.copy().astype(np.float64)
+    for i, c in enumerate(sa["feats"]):
+        if c in sa["log"]: x[:, i] = np.log(np.maximum(x[:, i], 1))
+        if c == "snd_spikes": x[:, i] = np.log1p(x[:, i])
+    z = ((x - ssc.mean_) / np.where(ssc.scale_ == 0, 1, ssc.scale_)).astype(f32); h = z
+    for k in range(3): h = np.maximum(0, h @ Wa[k].astype(f32) + Ba[k].astype(f32))
+    o = h @ Wa[3].astype(f32) + Ba[3].astype(f32)
+    e = ((o - z) ** 2).mean(axis=1)
+    return np.clip(np.log10(np.maximum(e, 1e-9) / sa["LO"]) / np.log10(sa["HI"] / sa["LO"]), 0, 1)
+raw_snd = rec.dropna(subset=sa["feats"])
+py = pd.read_csv(f"{PROC}/sound_ai.csv", encoding="utf-8-sig").set_index("time")["s_snd_ai"].reindex(raw_snd["time"]).to_numpy()
+dv = ae_dev(raw_snd[sa["feats"]].to_numpy())
+print(f"{len(dv):,}개 기록에서 장치식 소음 부담과 파이썬 값의 최대 차이: {np.nanmax(np.abs(dv - py)):.2e}")
